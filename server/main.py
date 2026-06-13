@@ -590,6 +590,9 @@ def _remove_media_cache(gid: str, filename: str) -> None:
     lc = _list_caches.get(gid)
     if lc and lc.get("data") is not None:
         lc["data"] = [f for f in lc["data"] if f.get("name") != filename]
+    cache_key = f"{gid}:{filename}"
+    _thumb_cache.pop(cache_key, None)
+    _missing_thumb_cache.pop(cache_key, None)
 
 
 def _update_cached_caption(gid: str, filename: str, caption: str,
@@ -1557,7 +1560,7 @@ async def upload(
         enqueue_caption_job(db_path, save_name)
         log.info("Upload[%s]: caption job queued", save_name)
 
-    # Track uploader so they can delete their own file later
+    # Track uploader for the session-specific "mine" marker in media lists.
     if mp_session:
         try:
             set_uploader_session(db_path, save_name, mp_session)
@@ -1597,22 +1600,21 @@ async def delete_media(filename: str, mp_session: Optional[str] = Cookie(default
     folder  = ctx["folder"]
     db_path = _db_path(gid)
 
-    uploaders = get_uploader_sessions(db_path, [filename])
-    if uploaders.get(filename) != mp_session:
-        raise HTTPException(403, "You can only delete files you uploaded")
-
     dbx = DropboxClient()
     try:
-        dbx.delete(f"{folder}/{filename}")
-        log.info("Delete[%s]: removed from Dropbox", filename)
+        deleted = dbx.delete(f"{folder}/{filename}", missing_ok=True)
+        if deleted:
+            log.info("Delete[%s/%s]: removed from Dropbox by session %s", gid, filename, mp_session)
+        else:
+            log.warning("Delete[%s/%s]: Dropbox file was already missing; cleaning local state", gid, filename)
     except Exception as exc:
-        log.error("Delete[%s]: Dropbox delete failed: %s", filename, exc)
+        log.error("Delete[%s/%s]: Dropbox delete failed: %s", gid, filename, exc)
         raise HTTPException(500, "Failed to delete file from storage")
 
     try:
-        dbx.delete(f"{folder}/_thumbs/{filename}.jpg")
-    except Exception:
-        pass  # thumbnail may not exist — not an error
+        dbx.delete(f"{folder}/_thumbs/{filename}.jpg", missing_ok=True)
+    except Exception as exc:
+        log.warning("Delete[%s/%s]: thumbnail cleanup failed: %s", gid, filename, exc)
 
     delete_file_data(db_path, filename)
     _remove_media_cache(gid, filename)

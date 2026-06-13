@@ -442,8 +442,8 @@
                 :title="slideshowActive?'Pause slideshow':'Play slideshow'">
           <span x-text="slideshowActive?'⏸':'▶'"></span>
         </button>
-        <!-- Delete (only for uploader) -->
-        <button x-show="selected && selected.mine"
+        <!-- Delete -->
+        <button x-show="selected"
                 @click="deleteFile(selected)"
                 class="text-red-400 hover:text-red-300 transition text-base px-1"
                 title="Delete this file">🗑</button>
@@ -875,7 +875,7 @@
         },
 
         async deleteFile(file) {
-          if (!confirm(`Delete "${file.name}"?\nThis cannot be undone.`)) return;
+          if (!confirm(`Delete "${file.name}" for everyone?\nThis removes it from the event and cannot be undone.`)) return;
           try {
             const r = await fetch('/api/media/' + encodeURIComponent(file.name), {method: 'DELETE'});
             if (!r.ok) {

@@ -2,11 +2,23 @@ import mimetypes, os, threading
 from datetime import datetime
 from typing import Iterator, Optional
 import dropbox
+from dropbox.exceptions import ApiError
 from dropbox import files as dbx_files
 from dropbox.files import WriteMode
 
 MIME_FALLBACK = "application/octet-stream"
 STREAM_CHUNK = 65_536  # 64 KB chunks for streaming
+
+
+def _is_not_found_error(exc: ApiError) -> bool:
+    """Return True when Dropbox reports the target path is already missing."""
+    err = getattr(exc, "error", None)
+    try:
+        if err and err.is_path_lookup():
+            return err.get_path_lookup().is_not_found()
+    except AttributeError:
+        pass
+    return "not_found" in str(exc).lower()
 
 
 class DropboxClient:
@@ -76,9 +88,15 @@ class DropboxClient:
         """Return a 4-hour temporary direct-access URL for a file (supports Range requests)."""
         return self._dbx.files_get_temporary_link(path).link
 
-    def delete(self, path: str) -> None:
-        """Permanently delete a file from Dropbox."""
-        self._dbx.files_delete_v2(path)
+    def delete(self, path: str, missing_ok: bool = False) -> bool:
+        """Permanently delete a file from Dropbox. Returns False if already missing."""
+        try:
+            self._dbx.files_delete_v2(path)
+            return True
+        except ApiError as exc:
+            if missing_ok and _is_not_found_error(exc):
+                return False
+            raise
 
     def get_thumbnail(self, path: str) -> bytes:
         _, res = self._dbx.files_get_thumbnail_v2(
