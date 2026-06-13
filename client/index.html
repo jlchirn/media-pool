@@ -1,0 +1,1518 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=5.0">
+  <title>Media Pool</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <style>
+    #leaflet-map { height: calc(100dvh - 120px); width: 100%; }
+    .fade-in  { transition: opacity .35s ease; }
+    .slide-bar { transition: width .1s linear; }
+    [x-cloak] { display: none !important; }
+    @keyframes slide-from-right { from { opacity:0; transform:translateX(52px) } to { opacity:1; transform:none } }
+    @keyframes slide-from-left  { from { opacity:0; transform:translateX(-52px) } to { opacity:1; transform:none } }
+    .nav-next { animation: slide-from-right 220ms cubic-bezier(.25,.46,.45,.94) both }
+    .nav-prev { animation: slide-from-left  220ms cubic-bezier(.25,.46,.45,.94) both }
+  </style>
+</head>
+
+<!-- ─── body: all UI driven by a single Alpine component ─── -->
+<body class="bg-black min-h-screen text-white overscroll-none"
+      x-data="gallery()" x-init="init()" x-cloak>
+
+  <!-- ── Toast stack (top-right) ──────────────────────────────── -->
+  <div class="fixed top-3 right-3 z-[70] flex flex-col gap-2 pointer-events-none max-w-xs w-full">
+    <template x-for="t in toasts" :key="t.id">
+      <div x-transition:enter="transition ease-out duration-200"
+           x-transition:enter-start="opacity-0 translate-x-8"
+           x-transition:enter-end="opacity-100 translate-x-0"
+           x-transition:leave="transition ease-in duration-150"
+           x-transition:leave-start="opacity-100" x-transition:leave-end="opacity-0"
+           class="bg-gray-800/95 border border-white/10 text-sm px-4 py-2.5 rounded-2xl shadow-xl"
+           x-text="t.msg">
+      </div>
+    </template>
+  </div>
+
+  <!-- ── Header ────────────────────────────────────────────────── -->
+  <header class="sticky top-0 z-20 bg-black/90 backdrop-blur border-b border-white/5
+                 px-4 py-3 flex items-center gap-3">
+    <!-- Left: title -->
+    <div class="flex-1 min-w-0">
+      <h1 class="font-semibold truncate" :class="deviceClass==='desktop'?'text-xl':'text-base'"
+          x-text="event.name || 'Media Pool'"></h1>
+      <p x-show="nickname" class="text-xs text-gray-500 leading-none mt-0.5"
+         x-text="'Hi, ' + nickname"></p>
+    </div>
+
+    <!-- Right: context-sensitive buttons -->
+    <template x-if="!selectMode">
+      <div class="flex items-center gap-3 flex-shrink-0">
+        <span class="text-gray-600 text-xs hidden sm:block">
+          <span x-text="files.length + ' items'"></span>
+          <span x-show="onlineCount>1" x-text="' · '+onlineCount+' online'" class="text-green-600"></span>
+        </span>
+        <!-- Highlight video -->
+        <button x-show="files.filter(f=>isImage(f.name)).length>0"
+                @click="generateHighlight()" :disabled="highlightGenerating"
+                class="text-gray-400 hover:text-white transition disabled:opacity-30 text-base"
+                title="Generate highlight video">
+          <span x-show="!highlightGenerating">🎬</span>
+          <span x-show="highlightGenerating" class="animate-spin inline-block text-sm">↻</span>
+        </button>
+        <button @click="selectMode=true;selected=null"
+                class="text-gray-400 hover:text-white text-sm transition"
+                x-show="files.length>0">Select</button>
+        <button @click="logout()" class="text-gray-400 hover:text-white text-sm transition">Leave</button>
+      </div>
+    </template>
+    <template x-if="selectMode">
+      <div class="flex items-center gap-3 flex-shrink-0">
+        <span class="text-sm text-gray-300" x-text="Object.keys(selectedFiles).length+' selected'"></span>
+        <button @click="selectedFiles={}" class="text-xs text-gray-500 hover:text-white transition underline">
+          Clear
+        </button>
+        <button @click="selectMode=false;selectedFiles={}"
+                class="flex items-center gap-1 bg-white/10 hover:bg-white/20 text-white text-sm
+                       px-3 py-1 rounded-full transition">
+          ✕ Cancel
+        </button>
+      </div>
+    </template>
+  </header>
+
+  <!-- ── Filter / navigation bar ───────────────────────────────── -->
+  <div class="sticky top-[57px] z-10 bg-black/90 backdrop-blur border-b border-white/5
+              flex items-center gap-2 px-3 py-2">
+    <!-- Filter chips -->
+    <template x-for="f in ['all','photos','videos']" :key="f">
+      <button @click="filter=f"
+              :class="filter===f?'bg-white text-black':'bg-white/10 text-gray-400 hover:bg-white/20'"
+              class="px-3 py-1 rounded-full text-xs font-medium capitalize transition flex-shrink-0">
+        <span x-text="f"></span>
+        <span class="ml-1 opacity-50"
+              x-text="f==='all'?files.length
+                     :f==='photos'?files.filter(x=>isImage(x.name)).length
+                     :files.filter(x=>!isImage(x.name)).length">
+        </span>
+      </button>
+    </template>
+
+    <!-- Back-to-grid button (visible when not in grid) -->
+    <button x-show="view!=='grid' && view!=='list'"
+            @click="setView('grid')"
+            class="flex items-center gap-1 px-3 py-1 rounded-full text-xs
+                   bg-indigo-600/70 hover:bg-indigo-600 text-white transition flex-shrink-0">
+      ← Grid
+    </button>
+
+    <div class="ml-auto flex items-center gap-2">
+      <!-- Sort (hidden on map) -->
+      <button x-show="view!=='map'" @click="cycleSort()"
+              class="flex items-center gap-1 px-3 py-1 rounded-full text-xs
+                     bg-white/10 text-gray-400 hover:bg-white/20 transition">
+        <span x-text="sortLabel()"></span><span class="opacity-40">⇅</span>
+      </button>
+      <!-- View cycle -->
+      <button @click="cycleView()" title="Cycle view"
+              class="px-3 py-1 rounded-full text-xs bg-white/10 text-gray-400
+                     hover:bg-white/20 transition flex items-center gap-1.5">
+        <span class="text-lg leading-none" x-text="viewIcon()"></span>
+        <span class="hidden sm:inline text-gray-600" x-text="view"></span>
+      </button>
+    </div>
+  </div>
+
+  <!-- ── Main content ───────────────────────────────────────────── -->
+  <main class="pb-28">
+
+    <!-- Local upload previews (uploader-only until the server accepts each file) -->
+    <div x-show="localUploads.length>0"
+         class="px-3 py-3 border-b border-white/5 bg-gray-950/80">
+      <div class="flex items-center justify-between mb-2">
+        <p class="text-xs font-medium text-gray-400">Uploading</p>
+        <button x-show="localUploads.every(u=>u.state!=='preparing'&&u.state!=='uploading')"
+                @click="clearFinishedUploads()"
+                class="text-xs text-gray-600 hover:text-gray-300">Clear</button>
+      </div>
+      <div class="grid gap-2" :class="gridColsClass">
+        <template x-for="u in localUploads" :key="u.id">
+          <div class="relative aspect-square overflow-hidden rounded bg-gray-900 border border-white/10">
+            <template x-if="u.previewUrl && u.kind==='image'">
+              <img :src="u.previewUrl" class="w-full h-full object-cover opacity-80">
+            </template>
+            <template x-if="u.kind==='video'">
+              <div class="w-full h-full flex items-center justify-center bg-gray-800 text-3xl">▶</div>
+            </template>
+            <div class="absolute inset-x-0 bottom-0 bg-black/75 px-2 py-1">
+              <p class="text-[11px] truncate text-gray-200" x-text="u.name"></p>
+              <p class="text-[10px]"
+                 :class="u.state==='failed'?'text-red-300':u.state==='uploaded'?'text-green-300':'text-indigo-300'"
+                 x-text="uploadStateLabel(u)"></p>
+            </div>
+          </div>
+        </template>
+      </div>
+    </div>
+
+    <!-- Loading skeleton -->
+    <template x-if="loading">
+      <div class="grid gap-0.5 mt-0.5"
+           :class="gridColsClass">
+        <template x-for="i in 9" :key="i">
+          <div class="aspect-square bg-gray-900 animate-pulse"></div>
+        </template>
+      </div>
+    </template>
+
+    <!-- Empty state -->
+    <template x-if="!loading && visibleFiles.length===0 && view!=='map'">
+      <div class="flex flex-col items-center justify-center h-64 text-gray-600 gap-3">
+        <div class="text-5xl">📷</div>
+        <p class="text-sm" x-text="files.length===0?'No photos yet — be the first!':'Nothing matches.'"></p>
+      </div>
+    </template>
+
+    <!-- ── Grid view ────────────────────────────────────────────── -->
+    <div x-show="!loading && view==='grid' && visibleFiles.length>0"
+         class="grid gap-0.5 mt-0.5"
+         :class="gridColsClass">
+      <template x-for="file in visibleFiles" :key="file.name">
+        <div class="relative aspect-square overflow-hidden cursor-pointer bg-gray-900 group"
+             @click="selectMode?toggleSelect(file.name):openLightbox(file)">
+          <img :src="`/api/media/${encodeURIComponent(file.name)}/thumb`"
+               :alt="file.name" class="w-full h-full object-cover" loading="lazy">
+          <!-- Video play overlay -->
+          <div x-show="!isImage(file.name) && !selectMode"
+               class="absolute inset-0 flex items-center justify-center bg-black/25">
+            <div class="w-10 h-10 rounded-full bg-black/60 flex items-center justify-center">
+              <span class="text-lg ml-0.5">▶</span>
+            </div>
+          </div>
+          <!-- Reaction badge -->
+          <div x-show="!selectMode && getTopEmojis(file).length>0"
+               class="absolute bottom-1 left-1 bg-black/70 rounded-md px-1.5 py-0.5 text-xs leading-tight">
+            <span x-text="getTopEmojis(file).map(r=>`${r.emoji}${r.count}`).join(' ')"></span>
+          </div>
+          <!-- Stats badge -->
+          <div x-show="!selectMode && (file.view_count>0||file.comment_count>0)"
+               class="absolute bottom-1 right-1 bg-black/70 rounded-md px-1.5 py-0.5 text-xs text-gray-400 flex gap-1.5">
+            <span x-show="file.view_count>0" x-text="'👁'+file.view_count"></span>
+            <span x-show="file.comment_count>0" x-text="'💬'+file.comment_count"></span>
+          </div>
+          <!-- GPS badge -->
+          <div x-show="!selectMode && file.lat!=null"
+               class="absolute top-1 right-1 bg-black/60 rounded text-xs px-1 py-0.5 leading-tight">
+            📍
+          </div>
+          <!-- Select overlay -->
+          <div x-show="selectMode"
+               class="absolute inset-0 flex items-end justify-end p-2"
+               :class="selectedFiles[file.name]?'bg-indigo-600/40':'bg-black/10'">
+            <div class="w-6 h-6 rounded-full border-2 flex items-center justify-center text-xs font-bold"
+                 :class="selectedFiles[file.name]?'bg-indigo-500 border-indigo-500 text-white':'border-white/50 bg-black/20'">
+              <span x-show="selectedFiles[file.name]">✓</span>
+            </div>
+          </div>
+        </div>
+      </template>
+    </div>
+
+    <!-- ── List view ─────────────────────────────────────────────── -->
+    <div x-show="!loading && view==='list' && visibleFiles.length>0" class="divide-y divide-white/5">
+      <template x-for="file in visibleFiles" :key="file.name">
+        <div class="flex items-center gap-3 px-4 py-2.5 cursor-pointer hover:bg-white/5 active:bg-white/10"
+             :class="selectedFiles[file.name]?'bg-indigo-900/20':''"
+             @click="selectMode?toggleSelect(file.name):openLightbox(file)">
+          <div x-show="selectMode"
+               class="w-5 h-5 rounded-full border-2 flex-shrink-0 flex items-center justify-center text-xs"
+               :class="selectedFiles[file.name]?'bg-indigo-500 border-indigo-500 text-white':'border-white/30'">
+            <span x-show="selectedFiles[file.name]">✓</span>
+          </div>
+          <div class="relative w-12 h-12 flex-shrink-0 rounded-lg overflow-hidden bg-gray-800">
+            <img :src="`/api/media/${encodeURIComponent(file.name)}/thumb`"
+                 :alt="file.name" class="w-full h-full object-cover" loading="lazy">
+            <div x-show="!isImage(file.name)"
+                 class="absolute inset-0 flex items-center justify-center bg-black/40 text-xs">▶</div>
+          </div>
+          <div class="flex-1 min-w-0">
+            <p class="text-sm text-white truncate" x-text="file.name"></p>
+            <div class="flex flex-wrap gap-x-2 text-xs text-gray-500">
+              <span x-text="formatSize(file.size)+' · '+formatDate(file.captured_at||file.modified)"></span>
+              <span x-show="getTopEmojis(file).length"
+                    x-text="getTopEmojis(file).map(r=>`${r.emoji}${r.count}`).join(' ')"></span>
+              <span x-show="file.view_count>0" x-text="'👁 '+file.view_count"></span>
+              <span x-show="file.comment_count>0" x-text="'💬 '+file.comment_count"></span>
+              <span x-show="file.lat!=null" class="text-indigo-400/70">📍</span>
+            </div>
+            <p x-show="file.caption" class="text-xs text-gray-600 italic break-words leading-snug mt-0.5"
+               x-text="file.caption"></p>
+            <p x-show="!file.caption && captionStatusLabel(file)"
+               class="text-xs text-gray-700 mt-0.5"
+               x-text="captionStatusLabel(file)"></p>
+          </div>
+          <a x-show="!selectMode" :href="`/api/media/${encodeURIComponent(file.name)}/download`"
+             @click.stop class="flex-shrink-0 text-gray-500 hover:text-white px-2 py-1" download>↓</a>
+        </div>
+      </template>
+    </div>
+
+    <!-- ── Timeline view ─────────────────────────────────────────── -->
+    <div x-show="!loading && view==='timeline'">
+      <template x-if="visibleFilesGrouped.length===0">
+        <div class="flex flex-col items-center justify-center h-64 text-gray-600 gap-3">
+          <div class="text-5xl">📷</div>
+          <p class="text-sm">No photos yet.</p>
+        </div>
+      </template>
+      <template x-for="group in visibleFilesGrouped" :key="group.date">
+        <div>
+          <!-- Date header -->
+          <div @click="toggleDateGroup(group.date)"
+               class="flex items-center justify-between px-4 py-2.5 bg-gray-900/80
+                      cursor-pointer hover:bg-gray-800/80 sticky top-[105px] z-[5]
+                      border-b border-white/5">
+            <span class="text-sm font-semibold text-gray-200"
+                  x-text="formatTimelineDate(group.date)"></span>
+            <span class="text-xs text-gray-600"
+                  x-text="group.files.length+' · '+(collapsedDates[group.date]?'▸':'▾')"></span>
+          </div>
+          <!-- Photos grid -->
+          <div x-show="!collapsedDates[group.date]"
+               class="grid gap-0.5 mt-0.5"
+               :class="gridColsClass">
+            <template x-for="file in group.files" :key="file.name">
+              <div class="relative aspect-square overflow-hidden cursor-pointer bg-gray-900"
+                   @click="openLightbox(file)">
+                <img :src="`/api/media/${encodeURIComponent(file.name)}/thumb`"
+                     :alt="file.name" class="w-full h-full object-cover" loading="lazy">
+                <div x-show="!isImage(file.name)"
+                     class="absolute inset-0 flex items-center justify-center bg-black/25">
+                  <span class="text-2xl">▶</span>
+                </div>
+                <div x-show="getTopEmojis(file).length"
+                     class="absolute bottom-1 left-1 bg-black/70 rounded px-1 py-0.5 text-xs">
+                  <span x-text="getTopEmojis(file).map(r=>`${r.emoji}${r.count}`).join(' ')"></span>
+                </div>
+                <div x-show="file.lat!=null"
+                     class="absolute top-1 right-1 bg-black/60 rounded text-xs px-1 py-0.5 leading-tight">
+                  📍
+                </div>
+              </div>
+            </template>
+          </div>
+        </div>
+      </template>
+    </div>
+
+    <!-- ── Map view ───────────────────────────────────────────────── -->
+    <div x-show="!loading && view==='map'">
+      <div x-show="filesWithGPS.length===0 && !mapScanning"
+           class="text-center text-gray-600 text-sm py-3 border-b border-white/5">
+        No GPS data found.
+        <span class="text-gray-700">Photos with location enabled will appear here.</span>
+      </div>
+      <div x-show="mapScanning" class="text-center text-gray-600 text-xs py-2">
+        📍 Scanning photos for location data…
+      </div>
+      <div id="leaflet-map"></div>
+    </div>
+
+  </main>
+
+  <!-- ── Batch action bar ───────────────────────────────────────── -->
+  <div x-show="selectMode && visibleFiles.length>0"
+       class="fixed bottom-[84px] inset-x-0 z-30 flex justify-center px-4 pointer-events-none">
+    <div class="flex items-center gap-3 bg-gray-900/95 border border-white/10
+                text-white rounded-2xl shadow-2xl px-5 py-3 pointer-events-auto">
+      <span class="text-sm text-gray-300"
+            x-text="Object.keys(selectedFiles).length + ' of ' + visibleFiles.length"></span>
+      <button @click="selectAll()"
+              class="text-xs text-indigo-400 hover:text-indigo-300 underline transition">All</button>
+      <button @click="selectedFiles={}"
+              class="text-xs text-gray-500 hover:text-gray-300 underline transition">None</button>
+      <button @click="downloadZip()"
+              :disabled="zipping || Object.keys(selectedFiles).length===0"
+              class="flex items-center gap-1.5 bg-indigo-600 hover:bg-indigo-700
+                     disabled:opacity-40 text-white font-medium text-sm px-4 py-1.5
+                     rounded-full transition">
+        <span x-show="!zipping">↓ Download ZIP</span>
+        <span x-show="zipping" class="animate-spin">↻</span>
+      </button>
+    </div>
+  </div>
+
+  <!-- ── Upload FAB ─────────────────────────────────────────────── -->
+  <div x-show="!selectMode" class="fixed bottom-6 right-5 z-20">
+    <input type="file" x-ref="fileInput" class="hidden" multiple
+           :accept="event.allow_video?'image/*,video/*':'image/*'"
+           @change="uploadFast($event)">
+    <button @click="$refs.fileInput.click()" :disabled="uploading"
+            class="w-14 h-14 rounded-full bg-indigo-600 hover:bg-indigo-500 active:scale-95
+                   disabled:opacity-50 shadow-xl flex items-center justify-center
+                   text-2xl transition-all">
+      <span x-show="!uploading">+</span>
+      <span x-show="uploading" class="animate-spin text-lg">↻</span>
+    </button>
+  </div>
+
+  <!-- Upload progress toast -->
+  <div x-show="uploadMsg" x-transition
+       class="fixed bottom-24 left-1/2 -translate-x-1/2 bg-gray-800/95 border border-white/10
+              text-white text-sm px-5 py-2.5 rounded-full shadow-xl z-30 whitespace-nowrap"
+       x-text="uploadMsg">
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════════
+       LIGHTBOX
+       ═══════════════════════════════════════════════════════════ -->
+  <!-- Upload size choice -->
+  <div x-show="uploadPromptOpen" x-transition
+       class="fixed inset-0 z-[80] bg-black/70 backdrop-blur-sm flex items-end sm:items-center justify-center p-4">
+    <div class="w-full max-w-sm bg-gray-950 border border-white/10 rounded-2xl shadow-2xl p-5">
+      <h2 class="text-base font-semibold text-white">Upload files</h2>
+      <p class="text-sm text-gray-500 mt-1">
+        Choose how photos should be uploaded. Videos keep original quality.
+      </p>
+      <div class="mt-4 grid gap-2">
+        <button @click="uploadChoice='reduced'"
+                :class="uploadChoice==='reduced'?'border-indigo-500 bg-indigo-500/15':'border-white/10 bg-white/5'"
+                class="text-left border rounded-xl p-3 transition">
+          <div class="flex items-center justify-between gap-2">
+            <span class="text-sm font-medium">Reduced size</span>
+            <span class="text-xs text-indigo-300">Recommended</span>
+          </div>
+          <p class="text-xs text-gray-500 mt-1">Faster upload, long edge up to 2048px.</p>
+        </button>
+        <button @click="uploadChoice='original'"
+                :class="uploadChoice==='original'?'border-indigo-500 bg-indigo-500/15':'border-white/10 bg-white/5'"
+                class="text-left border rounded-xl p-3 transition">
+          <span class="text-sm font-medium">Original quality</span>
+          <p class="text-xs text-gray-500 mt-1">Preserves photo file size and detail.</p>
+        </button>
+      </div>
+      <div class="mt-5 flex gap-2">
+        <button @click="cancelUploadPrompt()"
+                class="flex-1 px-4 py-2 rounded-full bg-white/10 hover:bg-white/15 text-sm">Cancel</button>
+        <button @click="confirmUploadPrompt()"
+                class="flex-1 px-4 py-2 rounded-full bg-indigo-600 hover:bg-indigo-500 text-sm font-medium">
+          Continue
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <div x-show="selected"
+       x-transition:enter="transition ease-out duration-150"
+       x-transition:enter-start="opacity-0" x-transition:enter-end="opacity-100"
+       x-transition:leave="transition ease-in duration-100"
+       x-transition:leave-start="opacity-100" x-transition:leave-end="opacity-0"
+       @keydown.escape.window="closeLightbox()"
+       @keydown.arrow-left.window="prevMedia()"
+       @keydown.arrow-right.window="nextMedia()"
+       @touchstart.passive="handleTouchStart"
+       @touchmove="handleTouchMove"
+       @touchend.passive="handleTouchEnd"
+       class="fixed inset-0 bg-black z-50 flex flex-col"
+       x-ref="lightbox">
+
+    <!-- Slideshow progress -->
+    <div x-show="slideshowActive" class="absolute top-0 left-0 right-0 h-1 bg-white/10 z-10">
+      <div class="h-full bg-indigo-500 slide-bar" :style="`width:${slideshowProgress}%`"></div>
+    </div>
+
+    <!-- Top bar -->
+    <div class="flex items-center justify-between px-4 pt-4 pb-2 flex-shrink-0 z-10">
+      <div class="flex items-center gap-3">
+        <!-- Back to gallery -->
+        <button @click="closeLightbox()"
+                class="flex items-center gap-1.5 text-white/60 hover:text-white
+                       text-sm transition px-2 py-1 rounded-lg hover:bg-white/10">
+          ← Gallery
+        </button>
+      </div>
+      <div class="flex items-center gap-3">
+        <!-- Slideshow -->
+        <button @click="slideshowActive?stopSlideshow():startSlideshow()"
+                class="text-white/50 hover:text-white transition text-base px-1"
+                :title="slideshowActive?'Pause slideshow':'Play slideshow'">
+          <span x-text="slideshowActive?'⏸':'▶'"></span>
+        </button>
+        <!-- Delete (only for uploader) -->
+        <button x-show="selected && selected.mine"
+                @click="deleteFile(selected)"
+                class="text-red-400 hover:text-red-300 transition text-base px-1"
+                title="Delete this file">🗑</button>
+        <!-- Counter -->
+        <span class="text-gray-600 text-xs" x-text="(selectedIndex()+1)+' / '+visibleFiles.length"></span>
+        <!-- Close -->
+        <button @click="closeLightbox()"
+                class="text-white/50 hover:text-white text-2xl leading-none px-1 transition">×</button>
+      </div>
+    </div>
+
+    <!-- Media area (flex-1, centred) -->
+    <div class="flex-1 relative flex items-center justify-center min-h-0 px-2">
+
+      <!-- Prev arrow -->
+      <button x-show="selectedIndex()>0" @click="prevMedia()"
+              class="absolute left-0 top-1/2 -translate-y-1/2 z-10
+                     text-white/30 hover:text-white text-4xl px-2 py-6 transition">‹</button>
+
+      <!-- Animated media wrapper -->
+      <div :class="navAnimClass"
+           :style="(_swipeDrag||_swipeAnim)?`transform:translateX(${swipeX}px);transition:${_swipeDrag?'none':'transform 0.28s cubic-bezier(0.25,0.46,0.45,0.94)'}`:null"
+           class="w-full h-full flex items-center justify-center">
+
+        <!-- IMAGE with progressive loading -->
+        <template x-if="selected && isImage(selected.name)">
+          <div class="relative w-full h-full flex items-center justify-center">
+            <!-- Blurred thumb placeholder -->
+            <img :src="`/api/media/${encodeURIComponent(selected.name)}/thumb`"
+                 class="absolute max-w-full max-h-full object-contain fade-in"
+                 :style="fullImageLoaded?'opacity:0;pointer-events:none':'opacity:1'"
+                 style="filter:blur(12px);transform:scale(1.06)">
+            <!-- Full resolution image -->
+            <img :src="`/api/media/${encodeURIComponent(selected.name)}`"
+                 class="max-w-full max-h-full object-contain rounded fade-in select-none"
+                 :style="`opacity:${fullImageLoaded?1:0};transform:scale(${pinchScale});transform-origin:center;touch-action:none`"
+                 @load="fullImageLoaded=true">
+          </div>
+        </template>
+
+        <!-- VIDEO with temporary Dropbox link -->
+        <template x-if="selected && !isImage(selected.name)">
+          <div class="w-full h-full flex items-center justify-center">
+            <div x-show="videoLoading" class="flex flex-col items-center gap-2 text-gray-500">
+              <span class="animate-spin text-2xl">↻</span>
+              <span class="text-xs">Loading video…</span>
+            </div>
+            <video x-show="!videoLoading && videoUrl"
+                   :src="videoUrl"
+                   controls playsinline preload="metadata"
+                   class="max-w-full max-h-full rounded"
+                   style="max-height:70vh">
+            </video>
+            <div x-show="!videoLoading && !videoUrl"
+                 class="text-gray-500 text-sm text-center px-8">
+              Video unavailable. Try downloading instead.
+            </div>
+          </div>
+        </template>
+
+      </div><!-- /animated wrapper -->
+
+      <!-- Next arrow -->
+      <button x-show="selectedIndex()<visibleFiles.length-1" @click="nextMedia()"
+              class="absolute right-0 top-1/2 -translate-y-1/2 z-10
+                     text-white/30 hover:text-white text-4xl px-2 py-6 transition">›</button>
+    </div>
+
+    <!-- Bottom info panel -->
+    <div class="flex-shrink-0 overflow-y-auto px-4 pb-safe pb-4 pt-2 max-h-[45vh] flex flex-col gap-3">
+
+      <!-- Caption -->
+      <div class="px-2">
+        <div x-show="selected?.caption && !captionEditing"
+             class="flex flex-col items-center gap-1.5">
+          <p class="text-center text-sm text-gray-400 italic"
+             x-text="selected?.caption||''"></p>
+          <button @click="startCaptionEdit()"
+                  class="text-xs text-indigo-300 hover:text-indigo-200 px-2 py-1 rounded-full hover:bg-white/10">
+            Edit caption
+          </button>
+        </div>
+        <div x-show="selected?.caption && captionEditing"
+             class="flex flex-col gap-2">
+          <textarea x-model="captionDraft"
+                    maxlength="300"
+                    rows="3"
+                    class="w-full resize-none rounded-xl bg-white/10 border border-white/10
+                           text-sm text-white placeholder-gray-500 px-3 py-2 focus:outline-none
+                           focus:ring-1 focus:ring-indigo-400"></textarea>
+          <div class="flex justify-center gap-2">
+            <button @click="cancelCaptionEdit()"
+                    :disabled="captionSaving"
+                    class="px-3 py-1.5 rounded-full text-xs bg-white/10 hover:bg-white/15 disabled:opacity-50">
+              Cancel
+            </button>
+            <button @click="saveCaptionEdit()"
+                    :disabled="captionSaving"
+                    class="px-3 py-1.5 rounded-full text-xs bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50">
+              <span x-show="!captionSaving">Save</span>
+              <span x-show="captionSaving">Saving...</span>
+            </button>
+          </div>
+        </div>
+        <p x-show="selected && !selected.caption && captionStatusLabel(selected)"
+           class="text-center text-xs text-gray-600"
+           x-text="captionStatusLabel(selected)"></p>
+      </div>
+
+      <!-- Reactions -->
+      <div class="flex items-center justify-center gap-2 flex-wrap">
+        <template x-for="emoji in ['❤️','👍','🔥','😂']" :key="emoji">
+          <button @click="toggleReaction(selected.name,emoji)"
+                  :disabled="reactionLoading===selected?.name"
+                  class="flex items-center gap-1 bg-white/10 hover:bg-white/20
+                         disabled:opacity-40 px-3 py-1.5 rounded-full text-sm transition">
+            <span x-text="emoji"></span>
+            <span class="text-xs opacity-70" x-text="selected?.reactions?.[emoji]||0"></span>
+          </button>
+        </template>
+      </div>
+
+      <!-- Comment toggle -->
+      <div class="flex justify-center">
+        <button @click="toggleComments()"
+                class="flex items-center gap-2 text-sm text-gray-400 hover:text-white
+                       transition px-3 py-1.5 rounded-full hover:bg-white/10">
+          <span>💬</span>
+          <span x-text="commentCountLabel()"></span>
+          <span x-text="commentsOpen?'▴':'▾'" class="text-xs opacity-60"></span>
+        </button>
+      </div>
+
+      <!-- Comments panel -->
+      <div x-show="commentsOpen" x-transition class="flex flex-col gap-2">
+        <div x-show="commentsLoading" class="text-center text-gray-600 text-xs py-2">Loading…</div>
+        <div x-show="!commentsLoading && comments.length===0"
+             class="text-center text-gray-700 text-xs py-1">No comments yet. Be the first!</div>
+        <!-- Comment list -->
+        <div class="flex flex-col gap-2.5 max-h-36 overflow-y-auto pr-1">
+          <template x-for="c in comments" :key="c.id">
+            <div class="flex items-start gap-2 group">
+              <div class="flex-1 min-w-0">
+                <div class="flex items-baseline gap-1.5 flex-wrap">
+                  <span class="text-xs font-semibold text-indigo-400"
+                        x-text="c.nickname||'Anonymous'"></span>
+                  <span class="text-xs text-gray-700" x-text="relTime(c.timestamp)"></span>
+                </div>
+                <p class="text-sm text-white/90 break-words leading-snug" x-text="c.text"></p>
+              </div>
+              <button x-show="c.is_mine" @click="deleteComment(c.id)"
+                      class="text-gray-700 hover:text-red-400 text-sm opacity-0 group-hover:opacity-100
+                             flex-shrink-0 transition mt-0.5">✕</button>
+            </div>
+          </template>
+        </div>
+        <!-- Comment input -->
+        <div class="flex gap-2 pt-1">
+          <input x-model="commentText"
+                 @keydown.enter.prevent="submitComment()"
+                 maxlength="500" placeholder="Add a comment…"
+                 class="flex-1 bg-white/10 text-white placeholder-gray-600 text-sm
+                        rounded-full px-4 py-2 focus:outline-none focus:ring-1 focus:ring-indigo-500 min-w-0">
+          <button @click="submitComment()"
+                  :disabled="submittingComment || !commentText.trim()"
+                  class="bg-indigo-600 hover:bg-indigo-700 disabled:opacity-40 text-white
+                         text-sm px-4 py-2 rounded-full transition flex-shrink-0">
+            <span x-show="!submittingComment">Post</span>
+            <span x-show="submittingComment" class="animate-spin">↻</span>
+          </button>
+        </div>
+      </div>
+
+      <!-- GPS location link -->
+      <a x-show="selected?.lat!=null"
+         :href="selected?.lat!=null?`https://maps.google.com/?q=${selected.lat},${selected.lng}`:'#'"
+         target="_blank" rel="noopener"
+         class="flex items-center justify-center gap-1 text-xs text-indigo-400/70
+                hover:text-indigo-400 transition pt-0.5">
+        📍
+        <span x-text="selected?.lat?.toFixed(5)+', '+selected?.lng?.toFixed(5)"></span>
+        <span class="opacity-50">↗</span>
+      </a>
+
+      <!-- File info + download -->
+      <div class="flex items-center justify-between pt-1">
+        <p class="text-gray-700 text-xs truncate min-w-0 mr-2"
+           x-text="selected?.name||''"></p>
+        <a :href="selected?`/api/media/${encodeURIComponent(selected.name)}/download`:'#'"
+           class="flex-shrink-0 text-xs bg-white/10 hover:bg-white/20 text-white
+                  px-3 py-1.5 rounded-full transition" download>
+          ↓ Download
+        </a>
+      </div>
+    </div>
+  </div><!-- end lightbox -->
+
+  <!-- ═══════════════════════════════════════════════════════════
+       JAVASCRIPT
+       ═══════════════════════════════════════════════════════════ -->
+  <script>
+    const IMAGE_EXTS = new Set(['jpg','jpeg','png','gif','webp','heic','heif']);
+
+    function gallery() {
+      return {
+        // ── Core ─────────────────────────────────────────────────
+        event: {}, files: [], nickname: '',
+        filter: 'all',
+        sort: localStorage.getItem('mp_sort') || 'newest',
+        view:  localStorage.getItem('mp_view') || 'grid',
+        loading: true,
+        selected: null,
+        uploading: false, uploadMsg: '',
+        uploadPromptOpen: false, uploadChoice: 'reduced',
+        _uploadPromptResolver: null,
+        localUploads: [],
+        selectMode: false, selectedFiles: {},
+        zipping: false,
+        reactionLoading: null,
+
+        // ── Device ───────────────────────────────────────────────
+        deviceClass: 'mobile',   // mobile | tablet | desktop
+
+        // ── Lightbox media ───────────────────────────────────────
+        fullImageLoaded: false,
+        videoUrl: null,
+        videoLoading: false,
+
+        // ── Slideshow ────────────────────────────────────────────
+        slideshowActive: false,
+        slideshowTimer: null,
+        slideshowProgress: 0,
+        slideshowProgressTimer: null,
+
+        // ── Navigation animation ─────────────────────────────────
+        navAnimClass: '',
+
+        // ── Touch gestures ───────────────────────────────────────
+        _touchStartX: 0, _touchStartY: 0,
+        _touchStartDist: 0,
+        pinchScale: 1, _pinchScaleBase: 1,
+        swipeX: 0, _swipeDrag: false, _swipeAnim: false,
+
+        // ── Comments ─────────────────────────────────────────────
+        comments: [], commentText: '',
+        commentsLoading: false, commentsOpen: false,
+        submittingComment: false,
+        captionEditing: false,
+        captionDraft: '',
+        captionSaving: false,
+
+        // ── Timeline ─────────────────────────────────────────────
+        collapsedDates: {},
+
+        // ── Map ──────────────────────────────────────────────────
+        _leafletMap: null, _leafletMarkers: [],
+        mapScanning: false,
+
+        // ── SSE / live ───────────────────────────────────────────
+        onlineCount: 0, toasts: [],
+        _sse: null, _refreshTimer: null,
+
+        // ── Highlight ────────────────────────────────────────────
+        highlightGenerating: false,
+
+        // ── Computed ─────────────────────────────────────────────
+
+        get gridColsClass() {
+          return {
+            mobile:  'grid-cols-3',
+            tablet:  'grid-cols-4',
+            desktop: 'grid-cols-5',
+          }[this.deviceClass];
+        },
+
+        get visibleFiles() {
+          let list = this.filter==='photos' ? this.files.filter(f=>this.isImage(f.name))
+                   : this.filter==='videos' ? this.files.filter(f=>!this.isImage(f.name))
+                   : [...this.files];
+          if (this.sort==='oldest') list=list.slice().reverse();
+          else if (this.sort==='type') list=list.slice().sort((a,b)=>
+            this.isImage(a.name)===this.isImage(b.name)?0:this.isImage(a.name)?-1:1);
+          return list;
+        },
+
+        get visibleFilesGrouped() {
+          const g = {};
+          for (const f of this.visibleFiles) {
+            const ts = f.captured_at||f.modified;
+            const k = ts?ts.slice(0,10):'unknown';
+            (g[k]=g[k]||[]).push(f);
+          }
+          return Object.entries(g)
+            .sort(([a],[b])=>b.localeCompare(a))
+            .map(([date,files])=>({date,files}));
+        },
+
+        get filesWithGPS() {
+          return this.files.filter(f=>f.lat!=null&&f.lng!=null);
+        },
+
+        // ── Init ─────────────────────────────────────────────────
+
+        async init() {
+          this._updateDeviceClass();
+          window.addEventListener('resize', ()=>this._updateDeviceClass());
+
+          try {
+            const [listRes, meRes] = await Promise.all([
+              fetch('/api/media/list'),
+              fetch('/api/auth/me'),
+            ]);
+            if (listRes.status===401) { location.href='/login'; return; }
+            const data = await listRes.json();
+            this.event = data.event;
+            this.files = data.files;
+            if (meRes.ok) {
+              const me = await meRes.json();
+              this.nickname = me.nickname||'';
+            }
+          } catch(e) {
+            console.error('init failed:', e);
+          } finally {
+            this.loading = false;
+          }
+
+          if (this.view==='map') setTimeout(()=>this.initMap(), 200);
+          this._connectSSE();
+        },
+
+        // ── Device ───────────────────────────────────────────────
+
+        _updateDeviceClass() {
+          const w = window.innerWidth;
+          this.deviceClass = w<640 ? 'mobile' : w<1024 ? 'tablet' : 'desktop';
+        },
+
+        // ── Helpers ──────────────────────────────────────────────
+
+        isImage(name) {
+          return IMAGE_EXTS.has(name.split('.').pop().toLowerCase());
+        },
+        formatSize(b) {
+          if(b<1024) return b+'B';
+          if(b<1048576) return (b/1024).toFixed(1)+'KB';
+          return (b/1048576).toFixed(1)+'MB';
+        },
+        formatDate(iso) {
+          return new Date(iso).toLocaleDateString(undefined,{month:'short',day:'numeric'});
+        },
+        formatTimelineDate(d) {
+          if(d==='unknown') return 'Unknown date';
+          return new Date(d+'T12:00:00').toLocaleDateString(undefined,
+            {weekday:'long',year:'numeric',month:'long',day:'numeric'});
+        },
+        relTime(ts) {
+          const d=Date.now()/1000-ts;
+          if(d<60) return 'just now';
+          if(d<3600) return Math.floor(d/60)+'m ago';
+          if(d<86400) return Math.floor(d/3600)+'h ago';
+          return Math.floor(d/86400)+'d ago';
+        },
+        getTopEmojis(file) {
+          if(!file.reactions) return [];
+          return Object.entries(file.reactions)
+            .filter(([,c])=>c>0).sort(([,a],[,b])=>b-a)
+            .slice(0,3).map(([emoji,count])=>({emoji,count}));
+        },
+        selectedIndex() {
+          if(!this.selected) return -1;
+          return this.visibleFiles.findIndex(f=>f.name===this.selected.name);
+        },
+        commentCountLabel() {
+          const n = this.selected?.comment_count || this.comments.length || 0;
+          return n+' comment'+(n===1?'':'s');
+        },
+        captionStatusLabel(file) {
+          if(!file || file.caption) return '';
+          const s = file.caption_status || 'none';
+          if(s==='pending') return 'Caption pending';
+          if(s==='processing') return 'Generating caption...';
+          if(s==='failed') return 'Caption failed';
+          return '';
+        },
+
+        // ── Sort / view ───────────────────────────────────────────
+
+        cycleSort() {
+          const o=['newest','oldest','type'];
+          this.sort=o[(o.indexOf(this.sort)+1)%o.length];
+          localStorage.setItem('mp_sort',this.sort);
+        },
+        sortLabel() {
+          return {newest:'Newest',oldest:'Oldest',type:'By type'}[this.sort];
+        },
+        cycleView() {
+          const modes=['grid','list','timeline','map'];
+          const next=modes[(modes.indexOf(this.view)+1)%modes.length];
+          this.setView(next);
+        },
+        setView(v) {
+          this.view=v;
+          localStorage.setItem('mp_view',v);
+          if(v==='map') setTimeout(()=>this.initMap(), 200);
+        },
+        viewIcon() {
+          return {grid:'⊞',list:'☰',timeline:'📅',map:'🗺️'}[this.view];
+        },
+        toggleDateGroup(date) {
+          this.collapsedDates={...this.collapsedDates,[date]:!this.collapsedDates[date]};
+        },
+
+        // ── Lightbox ─────────────────────────────────────────────
+
+        openLightbox(file) {
+          this.selected        = file;
+          this.fullImageLoaded = false;
+          this.videoUrl        = null;
+          this.videoLoading    = false;
+          this.pinchScale      = 1;
+          this._pinchScaleBase = 1;
+          this.comments        = [];
+          this.commentsOpen    = false;
+          this.commentText     = '';
+          this.captionEditing  = false;
+          this.captionDraft    = file.caption || '';
+          this.captionSaving   = false;
+          if (!this.isImage(file.name)) this._loadVideoUrl(file.name);
+        },
+
+        async deleteFile(file) {
+          if (!confirm(`Delete "${file.name}"?\nThis cannot be undone.`)) return;
+          try {
+            const r = await fetch('/api/media/' + encodeURIComponent(file.name), {method: 'DELETE'});
+            if (!r.ok) {
+              const err = await r.json().catch(() => ({}));
+              alert(err.detail || 'Delete failed');
+              return;
+            }
+            this.files = this.files.filter(f => f.name !== file.name);
+            this.closeLightbox();
+          } catch(e) {
+            alert('Delete failed: ' + e.message);
+          }
+        },
+
+        closeLightbox() {
+          this.stopSlideshow();
+          this.selected = null;
+          this.pinchScale = 1;
+        },
+
+        prevMedia() {
+          const i=this.selectedIndex();
+          if(i>0) this._navTo(this.visibleFiles[i-1], 'prev');
+        },
+        nextMedia() {
+          const i=this.selectedIndex();
+          if(i<this.visibleFiles.length-1) this._navTo(this.visibleFiles[i+1], 'next');
+          else if(this.slideshowActive) this.stopSlideshow();
+        },
+        _navTo(file, dir) {
+          this.navAnimClass = '';
+          this.openLightbox(file);
+          // Double rAF: first lets Alpine flush state, second triggers the animation
+          requestAnimationFrame(() => requestAnimationFrame(() => {
+            this.navAnimClass = dir === 'next' ? 'nav-next' : 'nav-prev';
+          }));
+        },
+
+        // ── Video temp link ───────────────────────────────────────
+
+        async _loadVideoUrl(filename) {
+          this.videoLoading = true;
+          try {
+            const res = await fetch(`/api/media/${encodeURIComponent(filename)}/link`);
+            if(res.ok) {
+              const d = await res.json();
+              this.videoUrl = d.url;
+            } else {
+              // Fallback: stream directly (no seeking but playback works)
+              this.videoUrl = `/api/media/${encodeURIComponent(filename)}`;
+            }
+          } catch {
+            this.videoUrl = `/api/media/${encodeURIComponent(filename)}`;
+          } finally {
+            this.videoLoading = false;
+          }
+        },
+
+        startCaptionEdit() {
+          if(!this.selected?.caption) return;
+          this.captionDraft = this.selected.caption;
+          this.captionEditing = true;
+        },
+        cancelCaptionEdit() {
+          this.captionDraft = this.selected?.caption || '';
+          this.captionEditing = false;
+        },
+        async saveCaptionEdit() {
+          if(!this.selected || this.captionSaving) return;
+          const caption = this.captionDraft.trim();
+          this.captionSaving = true;
+          try {
+            const r = await fetch(`/api/media/${encodeURIComponent(this.selected.name)}/caption`, {
+              method: 'POST',
+              headers: {'Content-Type': 'application/json'},
+              body: JSON.stringify({caption}),
+            });
+            if(!r.ok) {
+              const err = await r.json().catch(()=>({}));
+              alert(err.detail || 'Caption update failed');
+              return;
+            }
+            const d = await r.json();
+            this._applyCaptionUpdate(this.selected.name, d.caption, d.source || 'manual', d.status || 'done');
+            this.captionEditing = false;
+          } catch(e) {
+            alert('Caption update failed: '+e.message);
+          } finally {
+            this.captionSaving = false;
+          }
+        },
+        _applyCaptionUpdate(filename, caption, source='ai', status='done') {
+          const f=this.files.find(f=>f.name===filename);
+          if(f) {
+            f.caption=caption;
+            f.caption_source=source;
+            f.caption_status=status;
+          }
+          if(this.selected?.name===filename) {
+            this.selected.caption=caption;
+            this.selected.caption_source=source;
+            this.selected.caption_status=status;
+            this.captionDraft=caption;
+          }
+        },
+
+        // ── Touch gestures ────────────────────────────────────────
+
+        handleTouchStart(e) {
+          if(e.touches.length===1) {
+            this._touchStartX=e.touches[0].clientX;
+            this._touchStartY=e.touches[0].clientY;
+          } else if(e.touches.length===2) {
+            this._touchStartDist=Math.hypot(
+              e.touches[0].clientX-e.touches[1].clientX,
+              e.touches[0].clientY-e.touches[1].clientY);
+            this._pinchScaleBase=this.pinchScale;
+          }
+        },
+        handleTouchMove(e) {
+          if(e.touches.length===2 && this._touchStartDist>0) {
+            e.preventDefault();
+            const d=Math.hypot(
+              e.touches[0].clientX-e.touches[1].clientX,
+              e.touches[0].clientY-e.touches[1].clientY);
+            this.pinchScale=Math.min(5,Math.max(1,
+              this._pinchScaleBase*(d/this._touchStartDist)));
+          } else if(e.touches.length===1 && this.pinchScale<=1.05) {
+            const dx=e.touches[0].clientX-this._touchStartX;
+            const dy=e.touches[0].clientY-this._touchStartY;
+            // Only track when clearly more horizontal than vertical
+            if(Math.abs(dx)>8 && Math.abs(dx)>Math.abs(dy)*1.2) {
+              this._swipeDrag=true;
+              this.swipeX=dx;
+            }
+          }
+        },
+        handleTouchEnd(e) {
+          if(e.changedTouches.length===1 && e.touches.length===0 && this.pinchScale<=1.05) {
+            const dx=e.changedTouches[0].clientX-this._touchStartX;
+            const dy=e.changedTouches[0].clientY-this._touchStartY;
+            const wasDrag=this._swipeDrag;
+            if(wasDrag && Math.abs(dx)>50 && Math.abs(dx)>Math.abs(dy)*1.5) {
+              // Committed swipe: instant reset then navigate (navAnimClass handles entrance)
+              this._swipeDrag=true; this.swipeX=0; this._swipeDrag=false;
+              if(dx<0) this.nextMedia(); else this.prevMedia();
+            } else if(wasDrag) {
+              // Cancelled: spring back with CSS ease
+              this._swipeDrag=false;
+              this._swipeAnim=true;
+              requestAnimationFrame(()=>{
+                this.swipeX=0;
+                setTimeout(()=>{ this._swipeAnim=false; }, 300);
+              });
+            } else {
+              this._swipeDrag=false;
+              this.swipeX=0;
+            }
+          } else {
+            this._swipeDrag=false;
+            this.swipeX=0;
+          }
+        },
+
+        // ── Slideshow ─────────────────────────────────────────────
+
+        startSlideshow() {
+          if(!this.selected && this.visibleFiles.length>0)
+            this.openLightbox(this.visibleFiles[0]);
+          this.slideshowActive=true;
+          this._scheduleSlideshowNext();
+        },
+        stopSlideshow() {
+          this.slideshowActive=false;
+          clearTimeout(this.slideshowTimer);
+          clearInterval(this.slideshowProgressTimer);
+          this.slideshowProgress=0;
+        },
+        _scheduleSlideshowNext() {
+          this.slideshowProgress=0;
+          const start=Date.now(), dur=4000;
+          clearInterval(this.slideshowProgressTimer);
+          this.slideshowProgressTimer=setInterval(()=>{
+            this.slideshowProgress=Math.min(100,((Date.now()-start)/dur)*100);
+          },50);
+          this.slideshowTimer=setTimeout(()=>{
+            clearInterval(this.slideshowProgressTimer);
+            const i=this.selectedIndex();
+            if(i<this.visibleFiles.length-1){
+              this.openLightbox(this.visibleFiles[i+1]);
+              this._scheduleSlideshowNext();
+            } else this.stopSlideshow();
+          },dur);
+        },
+
+        // ── Comments ──────────────────────────────────────────────
+
+        async toggleComments() {
+          this.commentsOpen=!this.commentsOpen;
+          if(this.commentsOpen && this.selected && !this.comments.length)
+            await this.loadComments(this.selected.name);
+        },
+        async loadComments(filename) {
+          this.commentsLoading=true;
+          try {
+            const r=await fetch(`/api/media/${encodeURIComponent(filename)}/comments`);
+            if(r.ok) this.comments=(await r.json()).comments;
+          } catch{}
+          finally{ this.commentsLoading=false; }
+        },
+        async submitComment() {
+          if(!this.commentText.trim()||!this.selected) return;
+          this.submittingComment=true;
+          try {
+            const r=await fetch(`/api/media/${encodeURIComponent(this.selected.name)}/comments`,{
+              method:'POST',headers:{'Content-Type':'application/json'},
+              body:JSON.stringify({text:this.commentText.trim()}),
+            });
+            if(r.ok) {
+              const d=await r.json();
+              this.comments.push(d.comment);
+              this.commentText='';
+            }
+          } catch{}
+          finally{ this.submittingComment=false; }
+        },
+        async deleteComment(id) {
+          if(!this.selected) return;
+          try {
+            const r=await fetch(
+              `/api/media/${encodeURIComponent(this.selected.name)}/comments/${id}`,
+              {method:'DELETE'});
+            if(r.ok) {
+              this.comments=this.comments.filter(c=>c.id!==id);
+              const f=this.files.find(f=>f.name===this.selected.name);
+              if(f&&f.comment_count>0) f.comment_count--;
+            }
+          } catch{}
+        },
+
+        // ── Map ───────────────────────────────────────────────────
+
+        initMap() {
+          const el=document.getElementById('leaflet-map');
+          if(!el||typeof L==='undefined') return;
+          // Retry if container not laid out yet
+          if(el.offsetHeight<10) { setTimeout(()=>this.initMap(),150); return; }
+
+          if(!this._leafletMap) {
+            this._leafletMap=L.map(el,{zoomControl:true}).setView([20,0],2);
+            L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{
+              attribution:'© <a href="https://openstreetmap.org/copyright">OSM</a>',
+              maxZoom:19,
+            }).addTo(this._leafletMap);
+          }
+          this._leafletMap.invalidateSize();
+          this._updateMapMarkers();
+          this._scanExifForMap();
+        },
+        _updateMapMarkers() {
+          if(!this._leafletMap) return;
+          for(const m of this._leafletMarkers) m.remove();
+          this._leafletMarkers=[];
+          const gps=this.filesWithGPS;
+          if(!gps.length) return;
+          const bounds=[];
+          for(const f of gps) {
+            const shortName = f.name.length>22 ? f.name.slice(0,20)+'…' : f.name;
+            const popup=`<div style="width:140px;font-family:sans-serif">
+              <div style="width:100%;height:100px;border-radius:6px;overflow:hidden;background:#111;margin-bottom:6px">
+                <img src="/api/media/${encodeURIComponent(f.name)}/thumb"
+                     style="width:100%;height:100%;object-fit:cover;display:block">
+              </div>
+              <div style="font-size:10px;color:#666;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;margin-bottom:6px"
+                   title="${f.name}">${shortName}</div>
+              <button onclick="document.dispatchEvent(new CustomEvent('mp-open',{detail:'${f.name}'}))"
+                      style="width:100%;background:#4f46e5;color:#fff;border:none;border-radius:5px;padding:5px 0;font-size:12px;cursor:pointer">
+                View →
+              </button>
+            </div>`;
+            const marker=L.marker([f.lat,f.lng]).addTo(this._leafletMap).bindPopup(popup,{maxWidth:160});
+            this._leafletMarkers.push(marker);
+            bounds.push([f.lat,f.lng]);
+          }
+          if(bounds.length) this._leafletMap.fitBounds(bounds,{padding:[40,40],maxZoom:14});
+        },
+        async _scanExifForMap() {
+          const needs=this.files.filter(f=>this.isImage(f.name)&&f.lat==null);
+          if(!needs.length) return;
+          this.mapScanning=true;
+          for(let i=0;i<needs.length;i+=3) {
+            const batch=needs.slice(i,i+3);
+            const results=await Promise.all(batch.map(f=>
+              fetch(`/api/media/${encodeURIComponent(f.name)}/exif`)
+                .then(r=>r.ok?r.json():null).catch(()=>null)));
+            let changed=false;
+            for(let j=0;j<batch.length;j++) {
+              const m=results[j];
+              if(m&&m.lat!=null) {
+                const file=this.files.find(f=>f.name===batch[j].name);
+                if(file){ file.lat=m.lat; file.lng=m.lng; changed=true; }
+              }
+            }
+            if(changed) this._updateMapMarkers();
+          }
+          this.mapScanning=false;
+        },
+
+        // ── SSE ───────────────────────────────────────────────────
+
+        _connectSSE() {
+          if(this._sse) return;
+          try {
+            const es=new EventSource('/api/media/feed');
+            this._sse=es;
+            es.onmessage=e=>{ try{ this._handleSSE(JSON.parse(e.data)); }catch{} };
+            es.onerror=async ()=>{
+              es.close();          // stop native browser retry loop
+              this._sse=null;
+              try {
+                const r=await fetch('/api/auth/me');
+                if(r.status===401){ location.href='/login'; return; }
+              } catch{}
+              setTimeout(()=>this._connectSSE(),5000);
+            };
+          } catch{}
+        },
+        _handleSSE(ev) {
+          if(ev.type==='online') {
+            this.onlineCount=ev.count;
+          } else if(ev.type==='upload') {
+            this._showToast(`📷 ${ev.nickname} added a photo`);
+            clearTimeout(this._refreshTimer);
+            this._refreshTimer=setTimeout(()=>this._refreshFiles(),this.uploading?3500:2500);
+          } else if(ev.type==='caption') {
+            this._applyCaptionUpdate(ev.file, ev.caption, ev.source || 'ai', ev.status || 'done');
+          } else if(ev.type==='reaction') {
+            const f=this.files.find(f=>f.name===ev.file);
+            if(f){ if(!f.reactions)f.reactions={};
+              f.reactions[ev.emoji]=ev.count;
+              if(ev.count===0) delete f.reactions[ev.emoji];
+              f.reactions={...f.reactions}; }
+            if(this.selected?.name===ev.file) {
+              if(!this.selected.reactions)this.selected.reactions={};
+              this.selected.reactions[ev.emoji]=ev.count;
+              if(ev.count===0) delete this.selected.reactions[ev.emoji];
+              this.selected.reactions={...this.selected.reactions};
+            }
+          } else if(ev.type==='delete') {
+            this.files = this.files.filter(f => f.name !== ev.file);
+            if(this.selected?.name === ev.file) this.closeLightbox();
+          } else if(ev.type==='comment') {
+            const f=this.files.find(f=>f.name===ev.file);
+            if(this.selected?.name===ev.file && this.commentsOpen) {
+              const exists=this.comments.find(c=>c.id===ev.id);
+              if(!exists){
+                this.comments.push({id:ev.id,nickname:ev.nickname,
+                  text:ev.text,timestamp:ev.ts,is_mine:false});
+                if(f) f.comment_count=(f.comment_count||0)+1;
+              }
+            } else if(f) {
+              f.comment_count=(f.comment_count||0)+1;
+            }
+          }
+        },
+        _showToast(msg,dur=3500) {
+          const id=Date.now();
+          this.toasts.push({id,msg});
+          setTimeout(()=>{ this.toasts=this.toasts.filter(t=>t.id!==id); },dur);
+        },
+
+        // ── Upload ────────────────────────────────────────────────
+
+        async uploadFast(ev) {
+          const picked=Array.from(ev.target.files);
+          ev.target.value='';
+          if(!picked.length) return;
+          const mode=await this.chooseUploadMode();
+          if(!mode) return;
+
+          const batchId=Date.now();
+          const entries=picked.map((file,i)=>({
+            id:`${batchId}-${i}`, file, name:file.name,
+            kind:file.type.startsWith('video/')?'video':'image',
+            previewUrl:file.type.startsWith('image/')?URL.createObjectURL(file):'',
+            state:'preparing', error:'',
+            originalSize:file.size, uploadSize:file.size,
+          }));
+          this.localUploads=[...entries,...this.localUploads].slice(0,30);
+          this.uploading=true;
+          let done=0, failed=0, index=0;
+          const worker=async()=>{
+            while(index<entries.length) {
+              const entry=entries[index++];
+              const ok=await this.uploadOne(entry,mode);
+              ok ? done++ : failed++;
+              this.uploadMsg=`Uploaded ${done}/${entries.length}${failed?`, ${failed} failed`:''}`;
+            }
+          };
+          await Promise.all([worker(),worker()]);
+          this.uploading=false;
+          if(done>0) {
+            this.uploadMsg=`Uploaded ${done} file${done>1?'s':''}`;
+            await this._refreshFiles();
+            setTimeout(()=>{ this.uploadMsg=''; this.clearFinishedUploads(); },2500);
+          } else {
+            this.uploadMsg='Upload failed - check connection';
+            setTimeout(()=>{ this.uploadMsg=''; },3000);
+          }
+        },
+        chooseUploadMode() {
+          this.uploadChoice='reduced';
+          this.uploadPromptOpen=true;
+          return new Promise(resolve=>{ this._uploadPromptResolver=resolve; });
+        },
+        confirmUploadPrompt() {
+          this.uploadPromptOpen=false;
+          const resolve=this._uploadPromptResolver;
+          this._uploadPromptResolver=null;
+          if(resolve) resolve(this.uploadChoice);
+        },
+        cancelUploadPrompt() {
+          this.uploadPromptOpen=false;
+          const resolve=this._uploadPromptResolver;
+          this._uploadPromptResolver=null;
+          if(resolve) resolve(null);
+        },
+        uploadStateLabel(u) {
+          if(u.state==='preparing') return 'Preparing';
+          if(u.state==='uploading') return `Uploading ${this.formatSize(u.uploadSize||u.originalSize)}`;
+          if(u.state==='uploaded') return 'Uploaded';
+          return u.error || 'Failed';
+        },
+        clearFinishedUploads() {
+          const keep=[];
+          for(const u of this.localUploads) {
+            if(u.state==='preparing'||u.state==='uploading'||u.state==='failed') keep.push(u);
+            else if(u.previewUrl) URL.revokeObjectURL(u.previewUrl);
+          }
+          this.localUploads=keep;
+        },
+        async uploadOne(entry,mode) {
+          try {
+            const prepared=await this.prepareUploadFile(entry.file,mode);
+            entry.uploadSize=prepared.file.size;
+            entry.state='uploading';
+            const fd=new FormData();
+            fd.append('file',prepared.file,prepared.file.name);
+            fd.append('upload_mode',mode);
+            if(entry.file.lastModified) fd.append('client_modified',new Date(entry.file.lastModified).toISOString());
+            const r=await fetch('/api/media/upload',{method:'POST',body:fd});
+            if(!r.ok) {
+              const err=await r.json().catch(()=>({detail:'Error'}));
+              entry.state='failed';
+              entry.error=err.detail||'Upload failed';
+              return false;
+            }
+            const d=await r.json().catch(()=>({}));
+            entry.state='uploaded';
+            entry.serverName=d.name||prepared.file.name;
+            return true;
+          } catch(e) {
+            entry.state='failed';
+            entry.error='Upload failed';
+            return false;
+          }
+        },
+        async prepareUploadFile(file,mode) {
+          if(mode!=='reduced' || !file.type.startsWith('image/')) return {file,reduced:false};
+          const ext=(file.name.split('.').pop()||'').toLowerCase();
+          if(['gif','heic','heif'].includes(ext)) return {file,reduced:false};
+          let bitmap;
+          try { bitmap=await createImageBitmap(file); }
+          catch { return {file,reduced:false}; }
+          const maxSide=Math.max(bitmap.width,bitmap.height);
+          const scale=Math.min(1,2048/maxSide);
+          const canvas=document.createElement('canvas');
+          canvas.width=Math.max(1,Math.round(bitmap.width*scale));
+          canvas.height=Math.max(1,Math.round(bitmap.height*scale));
+          const ctx=canvas.getContext('2d');
+          ctx.drawImage(bitmap,0,0,canvas.width,canvas.height);
+          if(bitmap.close) bitmap.close();
+          const blob=await new Promise(resolve=>canvas.toBlob(resolve,'image/jpeg',0.82));
+          if(!blob || blob.size>=file.size) return {file,reduced:false};
+          const stem=file.name.replace(/\.[^.]+$/,'');
+          return {file:new File([blob],`${stem}.jpg`,{type:'image/jpeg',lastModified:file.lastModified}),reduced:true};
+        },
+
+        async upload(ev) {
+          const picked=Array.from(ev.target.files);
+          if(!picked.length) return;
+          this.uploading=true;
+          let done=0;
+          for(const file of picked) {
+            this.uploadMsg=`Uploading ${file.name}… (${done+1}/${picked.length})`;
+            const fd=new FormData(); fd.append('file',file);
+            try {
+              const r=await fetch('/api/media/upload',{method:'POST',body:fd});
+              if(!r.ok) {
+                const err=await r.json().catch(()=>({detail:'Error'}));
+                this.uploadMsg=`Error: ${err.detail}`;
+                await new Promise(r=>setTimeout(r,2500));
+              } else done++;
+            } catch {
+              this.uploadMsg='Upload failed — check connection';
+              await new Promise(r=>setTimeout(r,2500));
+            }
+          }
+          this.uploading=false;
+          ev.target.value='';
+          if(done>0) {
+            this.uploadMsg=`✓ ${done} file${done>1?'s':''} uploaded`;
+            await this._refreshFiles();
+            setTimeout(()=>{ this.uploadMsg=''; },2000);
+          }
+        },
+        async _refreshFiles() {
+          try {
+            const r=await fetch('/api/media/list');
+            if(r.ok) {
+              const d=await r.json();
+              this.files=d.files;
+              if(this.selected) {
+                const fresh=this.files.find(f=>f.name===this.selected.name);
+                if(fresh) this.selected=fresh;
+              }
+              if(this.view==='map') this._updateMapMarkers();
+            }
+          } catch{}
+        },
+
+        // ── Select / ZIP ──────────────────────────────────────────
+
+        toggleSelect(name) {
+          const s={...this.selectedFiles};
+          s[name]?delete s[name]:(s[name]=true);
+          this.selectedFiles=s;
+        },
+        selectAll() {
+          this.selectedFiles=Object.fromEntries(this.visibleFiles.map(f=>[f.name,true]));
+        },
+        async downloadZip() {
+          const keys=Object.keys(this.selectedFiles);
+          if(this.zipping||!keys.length) return;
+          this.zipping=true;
+          try {
+            const r=await fetch('/api/media/download-zip',{
+              method:'POST',headers:{'Content-Type':'application/json'},
+              body:JSON.stringify({files:keys}),
+            });
+            if(!r.ok) throw new Error(await r.text());
+            const blob=await r.blob();
+            const url=URL.createObjectURL(blob);
+            const a=document.createElement('a');
+            a.href=url; a.download='media.zip'; a.click();
+            URL.revokeObjectURL(url);
+          } catch(e){ alert('Download failed: '+e.message); }
+          finally{ this.zipping=false; }
+        },
+
+        // ── Reactions ─────────────────────────────────────────────
+
+        async toggleReaction(filename,emoji) {
+          if(this.reactionLoading===filename) return;
+          this.reactionLoading=filename;
+          try {
+            const r=await fetch(`/api/media/${encodeURIComponent(filename)}/react`,{
+              method:'POST',headers:{'Content-Type':'application/json'},
+              body:JSON.stringify({emoji}),
+            });
+            if(r.ok) {
+              const d=await r.json();
+              const f=this.files.find(f=>f.name===filename);
+              if(f){ if(!f.reactions)f.reactions={};
+                f.reactions[emoji]=d.count; f.reactions={...f.reactions}; }
+              if(this.selected?.name===filename) {
+                if(!this.selected.reactions)this.selected.reactions={};
+                this.selected.reactions[emoji]=d.count;
+                this.selected.reactions={...this.selected.reactions};
+              }
+            }
+          } catch{}
+          finally{ this.reactionLoading=null; }
+        },
+
+        // ── Highlight video ───────────────────────────────────────
+
+        async generateHighlight() {
+          if(this.highlightGenerating) return;
+          this.highlightGenerating=true;
+          const toastId=Date.now();
+          this.toasts.push({id:toastId,msg:'🎬 Generating highlight video…'});
+          try {
+            const r=await fetch('/api/media/highlight-video',{
+              method:'POST',headers:{'Content-Type':'application/json'},
+              body:JSON.stringify({files:[]}),
+            });
+            this.toasts=this.toasts.filter(t=>t.id!==toastId);
+            if(!r.ok) {
+              const err=await r.json().catch(()=>({detail:'Failed'}));
+              this._showToast('❌ '+err.detail); return;
+            }
+            const blob=await r.blob();
+            const url=URL.createObjectURL(blob);
+            const a=document.createElement('a'); a.href=url; a.download='highlight.mp4'; a.click();
+            URL.revokeObjectURL(url);
+            this._showToast('✅ Highlight video downloaded!');
+          } catch(e) {
+            this.toasts=this.toasts.filter(t=>t.id!==toastId);
+            this._showToast('❌ '+e.message);
+          } finally{ this.highlightGenerating=false; }
+        },
+
+        async logout() {
+          await fetch('/api/auth/logout',{method:'POST'});
+          location.href='/login';
+        },
+      };
+    }
+
+    // Open from Leaflet popup click (Alpine v3: _x_dataStack)
+    document.addEventListener('mp-open', e => {
+      const comp = document.querySelector('body')._x_dataStack?.[0];
+      if(comp) {
+        const f = comp.files.find(f=>f.name===e.detail);
+        if(f) comp.openLightbox(f);
+      }
+    });
+  </script>
+
+  <!-- Non-passive touchmove: only block pinch inside open lightbox -->
+  <script>
+    document.addEventListener('touchmove', function(e) {
+      if(e.touches.length < 2) return;
+      const lb = document.querySelector('[x-ref="lightbox"]');
+      if(lb && lb.style.display !== 'none') e.preventDefault();
+    }, { passive: false });
+  </script>
+</body>
+</html>

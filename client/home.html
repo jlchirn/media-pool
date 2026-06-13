@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+  <title>Media Pool</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
+  <style>[x-cloak]{display:none!important}</style>
+</head>
+<body class="bg-gray-950 min-h-screen text-white"
+      x-data="hostApp()" x-init="init()" x-cloak>
+
+  <div class="flex flex-col min-h-screen items-center justify-center px-4 py-12">
+
+    <!-- ── Step 1: Password ─────────────────────────────────────────── -->
+    <div x-show="step==='password'" class="w-full max-w-sm">
+
+      <div class="text-center mb-8">
+        <div class="text-5xl mb-3">🎬</div>
+        <h1 class="text-2xl font-bold tracking-tight">Media Pool</h1>
+        <p class="text-gray-500 text-sm mt-1">Enter the host PIN to manage events</p>
+      </div>
+
+      <form @submit.prevent="submitPin()" class="space-y-4">
+        <input x-model="pin" x-ref="pinInput"
+               type="password"
+               inputmode="numeric"
+               placeholder="PIN"
+               autocomplete="current-password"
+               :class="pinError ? 'border-red-500 focus:ring-red-500' : 'border-gray-700 focus:ring-indigo-500'"
+               class="w-full bg-gray-800 text-white px-4 py-3.5 rounded-xl border
+                      focus:outline-none focus:ring-2 text-center text-2xl tracking-[0.3em]">
+        <p x-show="pinError" x-text="pinError" class="text-red-400 text-sm text-center -mt-1"></p>
+        <button type="submit"
+                :disabled="!pin || loading"
+                class="w-full bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40
+                       text-white font-semibold py-3.5 rounded-xl transition text-base">
+          <span x-show="!loading">Enter</span>
+          <span x-show="loading" class="inline-flex items-center gap-2">
+            <span class="animate-spin">↻</span> Checking…
+          </span>
+        </button>
+      </form>
+
+      <p class="text-center text-gray-700 text-xs mt-8">
+        Joining as a friend? Scan the QR code shown by the host.
+      </p>
+
+    </div>
+
+    <!-- ── Step 2: Group list ───────────────────────────────────────── -->
+    <div x-show="step==='groups'" class="w-full max-w-md">
+
+      <div class="flex items-center justify-between mb-6">
+        <h2 class="text-xl font-semibold">Select event</h2>
+        <button @click="signOut()"
+                class="text-gray-500 hover:text-white text-sm transition">
+          Sign out
+        </button>
+      </div>
+
+      <!-- Loading skeleton -->
+      <div x-show="loading" class="space-y-2">
+        <template x-for="i in 3" :key="i">
+          <div class="bg-gray-800 rounded-xl h-[68px] animate-pulse"></div>
+        </template>
+      </div>
+
+      <!-- Error -->
+      <div x-show="fetchError && !loading"
+           class="bg-red-900/40 border border-red-700 text-red-300 text-sm px-4 py-3 rounded-xl"
+           x-text="fetchError"></div>
+
+      <!-- Groups -->
+      <div x-show="!loading" class="space-y-2">
+        <template x-for="g in groups" :key="g.group_id">
+          <button @click="selectGroup(g)"
+                  class="w-full text-left bg-gray-800 hover:bg-gray-700
+                         rounded-xl px-5 py-4 transition flex items-center gap-4
+                         active:scale-[0.98]">
+            <div class="flex-1 min-w-0">
+              <p class="font-medium truncate" x-text="g.name"></p>
+              <p class="text-gray-500 text-xs mt-0.5 truncate"
+                 x-text="g.valid_from + ' – ' + g.valid_until"></p>
+            </div>
+            <span :class="g.is_open
+                           ? 'bg-green-900/60 text-green-400 border border-green-700'
+                           : 'bg-gray-700 text-gray-400'"
+                  class="text-xs font-medium px-2.5 py-0.5 rounded-full flex-shrink-0"
+                  x-text="g.is_open ? 'Open' : 'Closed'">
+            </span>
+            <span class="text-gray-600 text-lg flex-shrink-0">›</span>
+          </button>
+        </template>
+
+        <div x-show="!loading && groups.length === 0"
+             class="text-center py-16 text-gray-600">
+          <div class="text-4xl mb-3">📭</div>
+          <p class="text-sm">No events found.</p>
+          <p class="text-xs mt-1 text-gray-700">
+            Check <code class="bg-gray-800 px-1 rounded">DROPBOX_GROUPS_ROOT</code> in your .env
+          </p>
+        </div>
+      </div>
+
+    </div>
+
+    <!-- ── Step 3: QR display ───────────────────────────────────────── -->
+    <div x-show="step==='qr'" class="w-full max-w-sm flex flex-col items-center gap-5">
+
+      <!-- Top bar -->
+      <div class="w-full flex items-center">
+        <button @click="step='groups'"
+                class="flex items-center gap-1.5 text-gray-400 hover:text-white
+                       text-sm transition px-2 py-1 -ml-2 rounded-lg hover:bg-white/5">
+          ← Back
+        </button>
+        <div class="flex-1 text-center">
+          <p class="font-semibold truncate px-2" x-text="selected?.name || ''"></p>
+          <p class="text-xs text-gray-500 mt-0.5" x-text="selected?.valid_from + ' – ' + selected?.valid_until"></p>
+        </div>
+        <div class="w-16"></div><!-- spacer to balance ← Back -->
+      </div>
+
+      <!-- Status badge -->
+      <span x-show="selected"
+            :class="selected?.is_open
+                     ? 'bg-green-900/60 text-green-400 border border-green-700'
+                     : 'bg-gray-700 text-gray-500'"
+            class="text-xs font-medium px-3 py-1 rounded-full"
+            x-text="selected?.is_open ? '● Event is open' : '○ Event is closed'">
+      </span>
+
+      <!-- QR code (white bg required for camera scanning) -->
+      <div class="bg-white rounded-2xl p-4 w-full shadow-2xl">
+        <img x-show="selected"
+             :src="selected ? selected.qr_url + '&_t=' + ts : ''"
+             :alt="selected?.name"
+             class="w-full h-auto block">
+      </div>
+
+      <p class="text-gray-600 text-xs text-center">
+        Friends scan this QR code to join the event
+      </p>
+
+      <!-- Action buttons -->
+      <div class="flex gap-3 w-full">
+        <a :href="selected ? selected.qr_url : '#'"
+           download
+           class="flex-1 flex items-center justify-center gap-1.5
+                  bg-gray-700 hover:bg-gray-600 text-white text-sm font-medium
+                  px-4 py-2.5 rounded-xl transition">
+          ↓ Save PNG
+        </a>
+        <button @click="copyLink()"
+                :class="copied
+                         ? 'bg-green-700 text-green-100'
+                         : 'bg-indigo-600 hover:bg-indigo-500 text-white'"
+                class="flex-1 flex items-center justify-center gap-1.5
+                       text-sm font-medium px-4 py-2.5 rounded-xl transition">
+          <span x-text="copied ? '✓ Copied' : '🔗 Copy link'"></span>
+        </button>
+      </div>
+
+    </div>
+
+  </div><!-- /flex container -->
+
+  <script>
+  function hostApp() {
+    return {
+      step: 'password',   // password | groups | qr
+      pin: '', pinError: '', loading: false,
+      groups: [], fetchError: '',
+      selected: null,
+      copied: false,
+      ts: Date.now(),
+
+      async init() {
+        // If admin cookie already set (refreshed page), skip straight to groups
+        const r = await fetch('/api/admin/groups').catch(() => null);
+        if (r && r.ok) {
+          this.groups = await r.json();
+          this.ts = Date.now();
+          this.step = 'groups';
+        }
+        // If failed, stay on password step
+      },
+
+      async submitPin() {
+        if (!this.pin) return;
+        this.loading = true;
+        this.pinError = '';
+        try {
+          const r = await fetch('/api/admin/unlock', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ pin: this.pin }),
+          });
+          if (r.ok) {
+            this.pin = '';
+            await this.loadGroups();
+            this.step = 'groups';
+          } else {
+            const d = await r.json().catch(() => ({}));
+            this.pinError = d.detail || 'Wrong PIN';
+          }
+        } catch {
+          this.pinError = 'Network error — is the server running?';
+        } finally {
+          this.loading = false;
+        }
+      },
+
+      async loadGroups() {
+        this.loading = true;
+        this.fetchError = '';
+        try {
+          const r = await fetch('/api/admin/groups');
+          if (!r.ok) throw new Error(`Server error ${r.status}`);
+          this.groups = await r.json();
+          this.ts = Date.now();
+        } catch (e) {
+          this.fetchError = e.message;
+        } finally {
+          this.loading = false;
+        }
+      },
+
+      selectGroup(g) {
+        this.selected = g;
+        this.copied = false;
+        this.step = 'qr';
+      },
+
+      signOut() {
+        this.step = 'password';
+        this.pin = '';
+        this.pinError = '';
+        this.groups = [];
+        this.selected = null;
+      },
+
+      async copyLink() {
+        try {
+          const r = await fetch(`/api/auth/join-link?group=${encodeURIComponent(this.selected.group_id)}`);
+          const { url } = await r.json();
+          const text = `${this.selected.name}\nJoin: ${url}`;
+          try {
+            await navigator.clipboard.writeText(text);
+          } catch {
+            const el = document.createElement('textarea');
+            el.value = text;
+            document.body.appendChild(el); el.select();
+            document.execCommand('copy');
+            document.body.removeChild(el);
+          }
+          this.copied = true;
+          setTimeout(() => { this.copied = false; }, 2500);
+        } catch {
+          alert('Could not get join link — is the server running?');
+        }
+      },
+    };
+  }
+  </script>
+</body>
+</html>

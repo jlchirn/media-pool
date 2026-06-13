@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+  <title>Media Pool — QR Codes</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
+</head>
+<body class="bg-gray-900 min-h-screen text-white">
+
+<div x-data="qrsApp()" x-init="init()" class="max-w-5xl mx-auto px-4 py-8">
+
+  <!-- Header -->
+  <div class="flex items-center justify-between mb-4">
+    <div class="flex items-center gap-3">
+      <div class="text-4xl">🔐</div>
+      <div>
+        <h1 class="text-2xl font-bold">QR Code Manager</h1>
+        <p class="text-gray-400 text-sm">Media Pool — Admin</p>
+      </div>
+    </div>
+    <button x-show="unlocked"
+            @click="reload()"
+            class="flex items-center gap-2 bg-gray-700 hover:bg-gray-600 text-white px-4 py-2 rounded-lg text-sm transition">
+      <span>↻</span> Refresh
+    </button>
+  </div>
+
+  <!-- Network IP notice -->
+  <div class="mb-6 rounded-xl px-4 py-3 text-sm"
+       :class="ipWarning ? 'bg-yellow-900/60 border border-yellow-600 text-yellow-200' : 'bg-gray-800 border border-gray-700 text-gray-400'">
+    <template x-if="!ipWarning">
+      <span>QR codes will use <span class="font-mono text-white" x-text="currentHost"></span> — the IP in this browser's address bar. Friends on the same Wi-Fi can scan them directly.</span>
+    </template>
+    <template x-if="ipWarning">
+      <span>
+        <strong class="text-yellow-300">Warning:</strong>
+        Your browser is accessing this page via <span class="font-mono" x-text="currentHost"></span>,
+        which may not be reachable by phones on your Wi-Fi.<br>
+        Check the <strong>server startup log</strong> for the correct LAN IP, then reopen this page at
+        <span class="font-mono">http://&lt;correct-ip&gt;:<span x-text="currentPort"></span>/qrs</span>.
+      </span>
+    </template>
+  </div>
+
+  <!-- PIN unlock panel -->
+  <div x-show="!unlocked" class="flex flex-col items-center justify-center py-16">
+    <div class="bg-gray-800 rounded-2xl p-8 w-full max-w-sm shadow-xl">
+      <div class="text-center mb-6">
+        <div class="text-5xl mb-3">🔒</div>
+        <h2 class="text-xl font-semibold">Admin PIN required</h2>
+        <p class="text-gray-400 text-sm mt-1">Enter the ADMIN_PIN from your .env file</p>
+      </div>
+
+      <form @submit.prevent="submitPin()" class="space-y-4">
+        <input
+          x-model="pin"
+          type="password"
+          inputmode="numeric"
+          placeholder="Enter PIN"
+          autocomplete="current-password"
+          :class="pinError ? 'border-red-500 focus:ring-red-500' : 'border-gray-600 focus:ring-indigo-500'"
+          class="w-full bg-gray-700 text-white px-4 py-3 rounded-xl border focus:outline-none focus:ring-2 text-center text-2xl tracking-widest"
+        >
+        <p x-show="pinError" x-text="pinError" class="text-red-400 text-sm text-center"></p>
+        <button
+          type="submit"
+          :disabled="!pin || loading"
+          class="w-full bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 disabled:cursor-not-allowed text-white font-semibold py-3 rounded-xl transition"
+        >
+          <span x-show="!loading">Unlock</span>
+          <span x-show="loading">Unlocking…</span>
+        </button>
+      </form>
+    </div>
+  </div>
+
+  <!-- Groups grid -->
+  <div x-show="unlocked">
+
+    <!-- Loading skeleton -->
+    <div x-show="loading && groups.length === 0">
+      <p class="text-gray-400 text-sm text-center mb-6 animate-pulse">
+        Loading events from Dropbox… this takes ~15 s on first load
+      </p>
+      <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-6">
+        <template x-for="i in 3" :key="i">
+          <div class="bg-gray-800 rounded-2xl p-6 animate-pulse">
+            <div class="h-5 bg-gray-700 rounded mb-4 w-3/4"></div>
+            <div class="bg-gray-700 rounded-xl aspect-square mb-4"></div>
+            <div class="h-4 bg-gray-700 rounded w-1/2"></div>
+          </div>
+        </template>
+      </div>
+    </div>
+
+    <!-- Empty state -->
+    <div x-show="!loading && groups.length === 0"
+         class="flex flex-col items-center justify-center py-24 text-gray-500">
+      <div class="text-6xl mb-4">📭</div>
+      <p class="text-lg font-medium">No groups found</p>
+      <p class="text-sm mt-1">Check DROPBOX_GROUPS_ROOT or DROPBOX_FOLDER_PATH in your .env</p>
+    </div>
+
+    <!-- Error banner -->
+    <div x-show="fetchError"
+         class="bg-red-900/50 border border-red-700 text-red-300 rounded-xl px-4 py-3 mb-6 text-sm">
+      <span x-text="fetchError"></span>
+    </div>
+
+    <!-- Group cards -->
+    <div x-show="groups.length > 0"
+         class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-6">
+      <template x-for="g in groups" :key="g.group_id">
+        <div class="bg-gray-800 rounded-2xl p-5 shadow-lg flex flex-col">
+
+          <!-- Card header -->
+          <div class="flex items-start justify-between mb-4">
+            <div class="flex-1 min-w-0 pr-2">
+              <h3 class="font-semibold text-lg leading-tight truncate" x-text="g.name"></h3>
+              <p class="text-gray-400 text-sm mt-0.5">
+                <span x-text="g.valid_from"></span> – <span x-text="g.valid_until"></span>
+              </p>
+            </div>
+            <span
+              :class="g.is_open ? 'bg-green-800 text-green-300' : 'bg-gray-700 text-gray-400'"
+              class="text-xs font-medium px-2 py-1 rounded-full flex-shrink-0"
+              x-text="g.is_open ? 'Open' : 'Closed'"
+            ></span>
+          </div>
+
+          <!-- QR image -->
+          <div class="bg-white rounded-xl p-3 mb-4 flex-1 flex items-center justify-center">
+            <img
+              :src="g.qr_url + '&_t=' + ts"
+              :alt="'QR for ' + g.name"
+              class="w-full max-w-[240px] h-auto mx-auto rounded"
+              loading="lazy"
+            >
+          </div>
+
+          <!-- Actions -->
+          <div class="flex gap-2">
+            <a
+              :href="g.qr_url"
+              download
+              class="flex-1 flex items-center justify-center gap-1.5 bg-gray-700 hover:bg-gray-600 text-white text-sm font-medium px-3 py-2 rounded-lg transition"
+              title="Save QR as PNG"
+            >
+              ↓ Save PNG
+            </a>
+            <button
+              @click="copyLink(g)"
+              :class="g._copied ? 'bg-green-700 text-green-100' : 'bg-indigo-700 hover:bg-indigo-600 text-white'"
+              class="flex-1 flex items-center justify-center gap-1.5 text-sm font-medium px-3 py-2 rounded-lg transition"
+              :title="g._copied ? 'Copied!' : 'Copy join link'"
+            >
+              <span x-text="g._copied ? '✓ Copied' : '🔗 Copy link'"></span>
+            </button>
+          </div>
+
+          <!-- Group ID badge -->
+          <p class="text-gray-600 text-xs mt-3 font-mono text-center" x-text="'id: ' + g.group_id"></p>
+
+        </div>
+      </template>
+    </div>
+
+  </div><!-- /unlocked -->
+
+</div><!-- /app -->
+
+<script>
+// Known VM/virtual-adapter subnets that phones on Wi-Fi cannot reach
+const VM_PREFIXES = ['192.168.122.', '192.168.124.', '192.168.136.', '192.168.56.', '192.168.99.'];
+
+function qrsApp() {
+  const host = window.location.host;       // host:port used to open this page
+  const hostname = window.location.hostname;
+  const isLocalhost = hostname === 'localhost' || hostname === '127.0.0.1';
+  const isVmIp = VM_PREFIXES.some(p => hostname.startsWith(p));
+
+  return {
+    unlocked: false,
+    pin: '',
+    pinError: '',
+    loading: false,
+    groups: [],
+    fetchError: '',
+    ts: Date.now(),
+    currentHost: host,
+    currentPort: window.location.port || '7000',
+    ipWarning: isLocalhost || isVmIp,
+
+    async init() {
+      // Try loading groups immediately — if the admin cookie is already set it'll work
+      await this.loadGroups();
+    },
+
+    async submitPin() {
+      if (!this.pin) return;
+      this.loading = true;
+      this.pinError = '';
+      try {
+        const r = await fetch('/api/admin/unlock', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ pin: this.pin }),
+        });
+        if (r.ok) {
+          this.pin = '';
+          this.loading = false;   // release button before slow groups fetch
+          this.unlocked = true;
+          await this.loadGroups();
+          return;
+        }
+        const d = await r.json().catch(() => ({}));
+        this.pinError = d.detail || 'Wrong PIN';
+      } catch (e) {
+        this.pinError = 'Network error — is the server running?';
+      } finally {
+        this.loading = false;
+      }
+    },
+
+    async loadGroups() {
+      this.loading = true;
+      this.fetchError = '';
+      try {
+        const r = await fetch('/api/admin/groups');
+        if (r.status === 403) {
+          // Not authenticated yet — stay on PIN screen
+          this.unlocked = false;
+          return;
+        }
+        if (!r.ok) {
+          const d = await r.json().catch(() => ({}));
+          this.fetchError = d.detail || `Server error ${r.status}`;
+          return;
+        }
+        const data = await r.json();
+        this.unlocked = true;
+        this.ts = Date.now();
+        this.groups = data.map(g => ({ ...g, _copied: false }));
+      } catch (e) {
+        this.fetchError = 'Network error — is the server running?';
+      } finally {
+        this.loading = false;
+      }
+    },
+
+    async reload() {
+      // Invalidate group cache and reload
+      this.groups = [];
+      await this.loadGroups();
+    },
+
+    async copyLink(g) {
+      try {
+        const r = await fetch(`/api/auth/join-link?group=${encodeURIComponent(g.group_id)}`);
+        const { url } = await r.json();
+        const shareText = `${g.name}\nJoin: ${url}`;
+        try {
+          await navigator.clipboard.writeText(shareText);
+        } catch {
+          const el = document.createElement('textarea');
+          el.value = shareText;
+          document.body.appendChild(el); el.select();
+          document.execCommand('copy');
+          document.body.removeChild(el);
+        }
+        g._copied = true;
+        setTimeout(() => { g._copied = false; }, 2000);
+      } catch {
+        alert('Could not get join link — is the server running?');
+      }
+    },
+  };
+}
+</script>
+</body>
+</html>
