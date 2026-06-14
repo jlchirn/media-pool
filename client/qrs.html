@@ -224,11 +224,11 @@ function qrsApp() {
       }
     },
 
-    async loadGroups() {
+    async loadGroups(url = '/api/admin/groups', options = {}) {
       this.loading = true;
       this.fetchError = '';
       try {
-        const r = await fetch('/api/admin/groups');
+        const r = await fetch(url, options);
         if (r.status === 403) {
           // Not authenticated yet — stay on PIN screen
           this.unlocked = false;
@@ -251,9 +251,9 @@ function qrsApp() {
     },
 
     async reload() {
-      // Invalidate group cache and reload
+      // Force the server to re-scan Dropbox for newly added or removed groups.
       this.groups = [];
-      await this.loadGroups();
+      await this.loadGroups('/api/admin/groups/refresh', { method: 'POST' });
     },
 
     async copyLink(g) {

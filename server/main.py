@@ -194,6 +194,10 @@ def _load_groups() -> dict:
 def _get_group(group_id: str) -> dict | None:
     return _load_groups().get(group_id)
 
+def _clear_groups_cache() -> None:
+    with _groups_lock:
+        _groups_cache.update(data=None, expires=0.0)
+
 
 # ── Event helpers ────────────────────────────────────────────────────────────
 
@@ -1035,6 +1039,25 @@ async def admin_groups(mp_admin: Optional[str] = Cookie(default=None)):
 
 
 # ── API: admin diagnostics ────────────────────────────────────────────────────
+
+@app.post("/api/admin/groups/refresh")
+async def admin_groups_refresh(mp_admin: Optional[str] = Cookie(default=None)):
+    _require_admin(mp_admin)
+    _clear_groups_cache()
+    t0 = time.time()
+    groups = _load_groups()
+    log.info("Admin groups refresh: %d groups returned (%.2fs)", len(groups), time.time() - t0)
+    result = []
+    for gid, g in groups.items():
+        ev = g["event"]; vf = ev.get("valid_from","")[:10]; vu = ev.get("valid_until","")[:10]
+        result.append({
+            "group_id": gid, "name": ev.get("name", gid),
+            "valid_from": vf, "valid_until": vu,
+            "is_open": _event_is_open(ev),
+            "qr_url": f"/api/auth/qr?group={urllib.parse.quote(gid)}",
+        })
+    return result
+
 
 @app.get("/api/admin/diagnostics")
 async def admin_diagnostics(mp_admin: Optional[str] = Cookie(default=None)):
