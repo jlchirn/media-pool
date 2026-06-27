@@ -430,7 +430,7 @@ def complete_caption_job(db_path: str, file_name: str, caption: str) -> str:
             (file_name,),
         ).fetchone()
         existing_caption = (row[0] if row else "") or ""
-        if existing_caption:
+        if existing_caption and existing_caption != "[Empty response]":
             final_caption = existing_caption
         else:
             final_caption = caption
@@ -571,7 +571,7 @@ def enqueue_missing_caption_jobs(db_path: str, file_names: list[str]) -> int:
                 (file_name,),
             )
             row = cur.fetchone()
-            if row and row[0]:
+            if row and row[0] and row[0] != "[Empty response]":
                 continue
             job = cur.execute(
                 "SELECT status FROM caption_jobs WHERE file_name=?",

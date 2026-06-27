@@ -17,6 +17,7 @@ from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Optional
+from starlette.background import BackgroundTask
 
 BASE_DIR = Path(__file__).parent.parent
 LOG_DIR = BASE_DIR / "logs"
@@ -98,22 +99,69 @@ _event_summaries: dict[str, str] = {}
 
 _caption_worker_started = False
 
+# vision model discovery cache: model id + expiry
+_vision_model_cache: dict = {"model": None, "expires": 0.0}
+_vision_model_lock = threading.Lock()
+
 # ── Constants ────────────────────────────────────────────────────────────────
 
-SECRET_KEY     = os.getenv("SECRET_KEY")
+def _env_int(name: str, default: int, minimum: int = 0) -> int:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        log.warning("%s=%r is not an integer; using %s", name, raw, default)
+        return default
+    if value < minimum:
+        log.warning("%s=%s is below minimum %s; using %s", name, value, minimum, default)
+        return default
+    return value
+
+
+SECRET_KEY     = os.getenv("SECRET_KEY", "").strip()
 if not SECRET_KEY:
-    SECRET_KEY = secrets.token_hex(32)
-    log.warning("SECRET_KEY not configured; generated a temporary key for this process")
+    allow_temp_secret = os.getenv("ALLOW_TEMP_SECRET_KEY", "").strip().lower() in {"1", "true", "yes", "on"}
+    if allow_temp_secret:
+        SECRET_KEY = secrets.token_hex(32)
+        log.warning("SECRET_KEY not configured; generated a temporary key because ALLOW_TEMP_SECRET_KEY is enabled")
+    else:
+        raise RuntimeError("SECRET_KEY must be configured in .env before starting Media Pool")
 ADMIN_PIN      = os.getenv("ADMIN_PIN",   "")
 ARENA_URL      = os.getenv("ARENA_URL",   "http://localhost:6059")
+CAPTION_MODEL  = os.getenv("CAPTION_MODEL", "gpt-5.4-nano")
+CAPTION_MODEL_FALLBACK = os.getenv("CAPTION_MODEL_FALLBACK", "")  # used when primary returns 422
+CAPTION_MIN_CHARS = 15  # captions shorter than this are retried
 LANGUAGE       = "English"   # default when event.json has no "language" field
 SESSION_COOKIE = "mp_session"
 ADMIN_COOKIE   = "mp_admin"
+
+ACTIVE_ONLINE_SECONDS = _env_int("ACTIVE_ONLINE_MINUTES", 30, 1) * 60
+UPLOAD_PROCESSING_LIMIT = _env_int("UPLOAD_PROCESSING_LIMIT", 2, 1)
+BLOCKING_WORK_LIMIT = _env_int("BLOCKING_WORK_LIMIT", 8, 1)
+MAX_PHOTO_UPLOAD_BYTES = _env_int("MAX_PHOTO_UPLOAD_MB", 75, 1) * 1024 * 1024
+MAX_VIDEO_UPLOAD_BYTES = _env_int("MAX_VIDEO_UPLOAD_MB", 500, 1) * 1024 * 1024
+MAX_ZIP_FILES = _env_int("MAX_ZIP_FILES", 50, 1)
+MAX_ZIP_TOTAL_BYTES = _env_int("MAX_ZIP_TOTAL_MB", 1024, 1) * 1024 * 1024
+MAX_HIGHLIGHT_FILES = _env_int("MAX_HIGHLIGHT_FILES", 20, 1)
+HIGHLIGHT_FFMPEG_TIMEOUT_SECONDS = _env_int("HIGHLIGHT_FFMPEG_TIMEOUT_SECONDS", 180, 30)
+
+MUSIC_DIR = Path(__file__).parent / "music"
+MUSIC_TRACKS: dict[str, dict] = {
+    "lively":  {"label": "輕快", "file": "lively.wav"},
+    "lyrical": {"label": "抒情", "file": "lyrical.wav"},
+    "serene":  {"label": "幽美", "file": "serene.wav"},
+    "dynamic": {"label": "動感", "file": "dynamic.wav"},
+}
 
 MEDIA_EXTS     = {"jpg","jpeg","png","gif","webp","heic","heif","mp4","mov","avi","m4v"}
 IMAGE_EXTS     = {"jpg","jpeg","png","gif","webp","heic","heif"}
 TRANSCODE_EXTS = {"mov","avi","m4v"}
 HEIC_EXTS      = {"heic","heif"}
+
+_blocking_work_sem = asyncio.Semaphore(BLOCKING_WORK_LIMIT)
+_upload_processing_sem = asyncio.Semaphore(UPLOAD_PROCESSING_LIMIT)
 
 
 # ── Config helpers ───────────────────────────────────────────────────────────
@@ -229,6 +277,34 @@ def _require_auth_ctx(mp_session: Optional[str]) -> dict:
         raise HTTPException(401, "Session expired")
     _sessions[mp_session]["last_seen"] = time.time()
     return {"group_id": group_id, "folder": group["folder"], "event": event}
+
+
+def _prune_expired_sessions(now: float | None = None) -> int:
+    """Remove sessions past their event idle timeout."""
+    now = now or time.time()
+    expired = []
+    for session_id, sess in list(_sessions.items()):
+        group = _get_group(sess.get("group_id", "default"))
+        if not group:
+            expired.append(session_id)
+            continue
+        idle_limit = group["event"].get("session_idle_hours", 24) * 3600
+        if now - sess.get("last_seen", 0) > idle_limit:
+            expired.append(session_id)
+    for session_id in expired:
+        _sessions.pop(session_id, None)
+    return len(expired)
+
+
+def _active_session_count(group_id: str, now: float | None = None) -> int:
+    """Count sessions touched within the active-online window."""
+    now = now or time.time()
+    _prune_expired_sessions(now)
+    cutoff = now - ACTIVE_ONLINE_SECONDS
+    return sum(
+        1 for sess in _sessions.values()
+        if sess.get("group_id") == group_id and sess.get("last_seen", 0) >= cutoff
+    )
 
 def _require_admin(mp_admin: Optional[str] = Cookie(default=None)):
     if not mp_admin or mp_admin not in _admin_sessions:
@@ -402,6 +478,23 @@ def _make_labeled_qr(url: str, title: str, subtitle: str = "") -> bytes:
 
 def _ext(filename: str) -> str:
     return filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+
+
+async def _run_blocking(func, *args, **kwargs):
+    async with _blocking_work_sem:
+        return await asyncio.to_thread(func, *args, **kwargs)
+
+
+def _format_mb(num_bytes: int) -> int:
+    return max(1, round(num_bytes / (1024 * 1024)))
+
+
+async def _read_upload_content(file: UploadFile, max_bytes: int) -> bytes:
+    content = await file.read(max_bytes + 1)
+    if len(content) > max_bytes:
+        raise HTTPException(413, f"File is too large. Limit is {_format_mb(max_bytes)} MB.")
+    return content
+
 
 def _extract_video_frame(content: bytes) -> bytes:
     with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as fin:
@@ -580,6 +673,135 @@ def _video_placeholder_thumb(filename: str) -> bytes:
     return buf.getvalue()
 
 
+def _load_thumb_data_sync(folder: str, filename: str, cache_key: str) -> bytes:
+    dbx = DropboxClient()
+    if _ext(filename) in IMAGE_EXTS:
+        try:
+            return dbx.get_thumbnail(f"{folder}/{filename}")
+        except Exception:
+            raw, _ = dbx.download(f"{folder}/{filename}")
+            from PIL import Image
+            img = Image.open(io.BytesIO(raw))
+            img.thumbnail((640, 640))
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG")
+            return buf.getvalue()
+
+    try:
+        data, _ = dbx.download(f"{folder}/_thumbs/{filename}.jpg")
+        return data
+    except Exception:
+        missing_key = f"{cache_key}:missing"
+        if _missing_thumb_cache.get(missing_key, 0) < time.time():
+            log.info("Thumb[%s]: video thumbnail missing; serving placeholder", filename)
+            _missing_thumb_cache[missing_key] = time.time() + 3600
+        return _video_placeholder_thumb(filename)
+
+
+def _build_zip_file_sync(folder: str, filenames: list[str]) -> str:
+    tmp = tempfile.NamedTemporaryFile(suffix=".zip", delete=False)
+    tmp_path = tmp.name
+    tmp.close()
+    total_bytes = 0
+    dbx = DropboxClient()
+    try:
+        with zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            for name in filenames:
+                arcname = name.replace("\\", "/").split("/")[-1]
+                try:
+                    stream, _ = dbx.download_stream(f"{folder}/{name}")
+                    with zf.open(arcname, "w") as dest:
+                        for chunk in stream:
+                            total_bytes += len(chunk)
+                            if total_bytes > MAX_ZIP_TOTAL_BYTES:
+                                raise ValueError(
+                                    f"ZIP download is too large. Limit is {_format_mb(MAX_ZIP_TOTAL_BYTES)} MB."
+                                )
+                            dest.write(chunk)
+                except ValueError:
+                    raise
+                except Exception as exc:
+                    log.warning("ZIP: skipped %s: %s", name, exc)
+        return tmp_path
+    except Exception:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def _create_highlight_video_sync(
+    folder: str, selected: list[str], music_path: str | None = None
+) -> tuple[str, list[str]]:
+    """Download selected images from Dropbox, encode an MP4 with ffmpeg, and return
+    (out_path, tmp_input_paths).  Caller is responsible for deleting both.
+    If music_path is given, the audio track is looped and mixed into the output."""
+    dbx = DropboxClient()
+    tmp_images: list[str] = []
+    out_path = ""
+    try:
+        for name in selected[:MAX_HIGHLIGHT_FILES]:
+            content, _ = dbx.download(f"{folder}/{name}")
+            tmp = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
+            tmp.write(content)
+            tmp.close()
+            tmp_images.append(tmp.name)
+
+        if not tmp_images:
+            raise ValueError("Could not download any images")
+
+        out_file = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
+        out_path  = out_file.name
+        out_file.close()
+
+        # Video inputs (each image shown for 3 s)
+        inputs_v: list[str] = []
+        for path in tmp_images:
+            inputs_v += ["-loop", "1", "-t", "3", "-i", path]
+
+        # Optional looping audio input
+        inputs_a: list[str] = (
+            ["-stream_loop", "-1", "-i", music_path] if music_path else []
+        )
+
+        fparts: list[str] = []
+        for i in range(len(tmp_images)):
+            fparts.append(
+                f"[{i}:v]scale=1080:1080:force_original_aspect_ratio=decrease,"
+                f"pad=1080:1080:(ow-iw)/2:(oh-ih)/2,setsar=1[v{i}]"
+            )
+        concat_in = "".join(f"[v{i}]" for i in range(len(tmp_images)))
+        fparts.append(f"{concat_in}concat=n={len(tmp_images)}:v=1:a=0[outv]")
+        filter_complex = ";".join(fparts)
+
+        audio_idx = len(tmp_images)   # index of the music input (if present)
+        cmd: list[str] = ["ffmpeg", "-y"] + inputs_v + inputs_a + [
+            "-filter_complex", filter_complex,
+            "-map", "[outv]",
+        ]
+        if music_path:
+            cmd += [f"-map", f"{audio_idx}:a",
+                    "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                    "-c:a", "aac", "-b:a", "128k",
+                    "-shortest", "-movflags", "+faststart", out_path]
+        else:
+            cmd += ["-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                    "-movflags", "+faststart", out_path]
+
+        subprocess.run(cmd, check=True, capture_output=True,
+                       timeout=HIGHLIGHT_FFMPEG_TIMEOUT_SECONDS)
+        return out_path, tmp_images
+    except Exception:
+        for p in tmp_images:
+            try: os.unlink(p)
+            except Exception: pass
+        if out_path:
+            try: os.unlink(out_path)
+            except Exception: pass
+        raise
+
+
 def _upsert_media_cache(gid: str, file_data: dict) -> None:
     lc = _list_caches.get(gid)
     if not lc or lc.get("data") is None:
@@ -671,7 +893,6 @@ def _arena_token() -> str | None:
 
 CAPTION_PROMPT_TEMPLATE = (
     "Describe this photo in one short, vivid sentence in {language}. "
-    "No more than 100 letters or 50 Chinese characters. "
     "Use a more specific noun for a place, an animal, a person, etc, "
     "rather than a general term. No preamble, no label."
 )
@@ -680,20 +901,126 @@ SUMMARY_PROMPT_TEMPLATE = (
     "based on the following photo captions:\n{captions}\n\nSummary:"
 )
 
+# ── Vision model discovery ────────────────────────────────────────────────────
+
+# Known name fragments that indicate a model can process image input.
+_VISION_NAME_HINTS = (
+    "gpt-4o", "gpt-4-vision", "gpt-5", "o1", "o3", "o4",
+    "claude-3", "claude-4", "claude-sonnet", "claude-opus", "claude-haiku",
+    "vision", "pixtral", "llava", "gemini", "qwen-vl", "qvq",
+    "internvl", "cogvlm",
+)
+
+
+def _pick_vision_model_from_list(models: list) -> str | None:
+    """Select the best vision-capable model from an Arena /v1/models response list."""
+    # Priority 1: explicit capability fields in the model metadata
+    for m in models:
+        mid = m.get("id", "")
+        # OpenAI-style modalities field
+        modalities = m.get("modalities") or m.get("input_modalities") or []
+        if isinstance(modalities, list) and any(
+            tok in ("image", "vision", "image_url") for tok in modalities
+        ):
+            return mid
+        # Capability object
+        caps = m.get("capabilities") or {}
+        if caps.get("vision") or caps.get("image_input"):
+            return mid
+        # Arena may use a "type" or "features" field
+        features = m.get("features") or []
+        if isinstance(features, list) and any(
+            tok in ("vision", "image", "multimodal") for tok in features
+        ):
+            return mid
+        model_type = m.get("type") or m.get("model_type") or ""
+        if "multimodal" in model_type or "vision" in model_type:
+            return mid
+
+    # Priority 2: name-based heuristics for well-known vision models
+    for m in models:
+        mid_lower = m.get("id", "").lower()
+        if any(hint in mid_lower for hint in _VISION_NAME_HINTS):
+            return m["id"]
+
+    return None
+
+
+def _discover_vision_model() -> str:
+    """Query Arena /v1/models, pick a vision-capable model, and cache the result 5 min.
+
+    Falls back to CAPTION_MODEL if Arena is unreachable or no vision model is found.
+    """
+    now = time.time()
+    with _vision_model_lock:
+        if _vision_model_cache["model"] and now < _vision_model_cache["expires"]:
+            return _vision_model_cache["model"]
+
+    token = _arena_token()
+    if not token:
+        return CAPTION_MODEL
+
+    try:
+        rq = urllib.request.Request(
+            f"{ARENA_URL}/v1/models",
+            headers={"Authorization": f"Bearer {token}", "Connection": "close"},
+        )
+        with urllib.request.urlopen(rq, timeout=10) as resp:
+            body = json.loads(resp.read())
+        models = body.get("data", [])
+        if not isinstance(models, list):
+            models = []
+
+        chosen = _pick_vision_model_from_list(models)
+        if not chosen:
+            log.warning("Caption: no vision-capable model found in Arena model list (%d models); "
+                        "using CAPTION_MODEL=%s. Consider setting CAPTION_MODEL explicitly.",
+                        len(models), CAPTION_MODEL)
+            chosen = CAPTION_MODEL
+        else:
+            log.info("Caption: auto-selected vision model '%s' from Arena (%d models available)",
+                     chosen, len(models))
+
+        with _vision_model_lock:
+            _vision_model_cache["model"] = chosen
+            _vision_model_cache["expires"] = now + 300  # re-check after 5 minutes
+
+        return chosen
+
+    except Exception as exc:
+        log.warning("Caption: could not query Arena /v1/models (%s) — using CAPTION_MODEL=%s",
+                    exc, CAPTION_MODEL)
+        return CAPTION_MODEL
+
+
+def _invalidate_vision_model_cache() -> None:
+    """Force re-discovery on the next caption request (call after a 422 error)."""
+    with _vision_model_lock:
+        _vision_model_cache["model"] = None
+        _vision_model_cache["expires"] = 0.0
+
+
 def _call_arena_caption(file_name: str, image_bytes: bytes, language: str = "") -> str:
-    """Return an AI caption for an image via Arena, or raise for the queue retry policy."""
+    """Return an AI caption for an image via Arena, or raise for the queue retry policy.
+
+    Retries up to 3 times for quality failures (truncated or too-short captions).
+    Falls back to CAPTION_MODEL_FALLBACK if the primary model returns 422 (no vision).
+    """
     token = _arena_token()
     if not token:
         raise RuntimeError("Arena token unavailable")
     lang = language or LANGUAGE
     caption_prompt = CAPTION_PROMPT_TEMPLATE.format(language=lang)
-    log.info("Caption[%s]: model=arena:auto/cheapest  lang=%s  prompt=%r",
-             file_name, lang, caption_prompt)
-    def _do_request(tok):
-        payload_image = _caption_payload_image(image_bytes)
-        b64 = base64.b64encode(payload_image).decode()
+
+    payload_image = _caption_payload_image(image_bytes)
+    b64 = base64.b64encode(payload_image).decode()
+    # Ask Arena which model is vision-capable; fall back to env var only if discovery fails
+    model = _discover_vision_model()
+    max_tokens = 300
+
+    def _do_request(tok: str, mdl: str, mtok: int):
         payload = json.dumps({
-            "model": "arena:auto/cheapest",
+            "model": mdl,
             "messages": [{
                 "role": "user",
                 "content": [
@@ -701,46 +1028,79 @@ def _call_arena_caption(file_name: str, image_bytes: bytes, language: str = "") 
                     {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
                 ],
             }],
-            "max_tokens": 160,
+            "max_tokens": mtok,
         }).encode()
-        req = urllib.request.Request(
+        rq = urllib.request.Request(
             f"{ARENA_URL}/v1/chat/completions",
             data=payload,
-            headers={"Content-Type": "application/json", "Authorization": f"Bearer {tok}"},
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {tok}",
+                "Connection": "close",
+            },
         )
-        return urllib.request.urlopen(req, timeout=60)
+        return urllib.request.urlopen(rq, timeout=60)
 
-    try:
+    log.info("Caption[%s]: model=%s  lang=%s", file_name, model, lang)
+    last_exc: Exception | None = None
+
+    for attempt in range(3):
         try:
-            resp = _do_request(token)
-        except urllib.request.HTTPError as e:
-            if e.code == 401:
-                # Token rejected — delete cached file and re-login once
-                log.warning("Arena caption: 401 for %s — refreshing token and retrying", file_name)
-                tf = _arena_token_file()
-                if tf.exists(): tf.unlink()
-                token = _arena_token()
-                if not token:
-                    raise RuntimeError("Arena token refresh failed")
-                resp = _do_request(token)
-            elif e.code == 422:
-                raise RuntimeError("Arena vision/multimodal not supported")
-            else:
-                raise
+            try:
+                resp = _do_request(token, model, max_tokens)
+            except urllib.request.HTTPError as e:
+                if e.code == 401:
+                    log.warning("Caption 401 for %s — refreshing token", file_name)
+                    tf = _arena_token_file()
+                    if tf.exists(): tf.unlink()
+                    token = _arena_token()
+                    if not token:
+                        raise RuntimeError("Arena token refresh failed")
+                    resp = _do_request(token, model, max_tokens)
+                elif e.code == 422:
+                    # Model rejected image input — invalidate cache and re-discover
+                    log.warning("Model '%s' rejected image input (HTTP 422) — "
+                                "invalidating model cache and re-discovering", model)
+                    _invalidate_vision_model_cache()
+                    new_model = _discover_vision_model()
+                    if new_model != model:
+                        log.info("Retrying caption with re-discovered model '%s'", new_model)
+                        model = new_model
+                        resp = _do_request(token, model, max_tokens)
+                    else:
+                        raise RuntimeError(
+                            f"No vision-capable model available in Arena (tried '{model}'). "
+                            "Check Arena model list or set CAPTION_MODEL to a vision-capable model."
+                        )
+                else:
+                    raise
+        except Exception as e:
+            log.warning("Arena caption failed for %s: %s", file_name, e)
+            raise
+
         body = json.loads(resp.read())
         choice = body["choices"][0]
         finish_reason = choice.get("finish_reason")
-        if finish_reason == "length":
-            log.warning("Arena caption may be truncated by token limit for %s", file_name)
-        else:
-            log.info("Arena caption finish_reason[%s]: %s", file_name, finish_reason)
         caption = choice["message"]["content"].strip()
-        if not caption:
-            raise RuntimeError("Arena returned an empty caption")
+
+        if finish_reason == "length":
+            # Response was cut off by the token limit — double the limit and retry
+            log.warning("Caption truncated at %d tokens for %s (attempt %d) — retrying",
+                        max_tokens, file_name, attempt + 1)
+            max_tokens = min(max_tokens * 2, 1200)
+            last_exc = RuntimeError(f"Caption cut off (finish_reason=length): {caption!r}")
+            continue
+
+        if not caption or len(caption) < CAPTION_MIN_CHARS:
+            log.warning("Caption too short (%d chars) for %s (attempt %d): %r",
+                        len(caption), file_name, attempt + 1, caption)
+            last_exc = RuntimeError(f"Caption too short ({len(caption)} chars): {caption!r}")
+            continue
+
+        log.info("Caption[%s] ok (model=%s, attempt=%d): %r", file_name, model, attempt + 1, caption[:80])
         return caption
-    except Exception as e:
-        log.warning("Arena caption failed for %s: %s", file_name, e)
-        raise
+
+    raise last_exc or RuntimeError("Caption quality check failed after 3 attempts")
 
 
 # ── Startup warmup ───────────────────────────────────────────────────────────
@@ -755,7 +1115,8 @@ def _process_one_caption_job_sync(gid: str, folder: str, event: dict) -> dict | 
     file_name = job["file_name"]
     try:
         existing = get_media_meta(db_path, [file_name]).get(file_name, {})
-        if existing.get("caption"):
+        existing_cap = existing.get("caption") or ""
+        if existing_cap and existing_cap != "[Empty response]":
             mark_caption_job_done(db_path, file_name)
             _update_cached_caption(
                 gid,
@@ -772,6 +1133,11 @@ def _process_one_caption_job_sync(gid: str, folder: str, event: dict) -> dict | 
         log.info("Caption job done[%s/%s]", gid, file_name)
         return {"ok": True, "file": file_name, "caption": caption}
     except Exception as exc:
+        if "not_found" in str(exc).lower():
+            delete_file_data(db_path, file_name)
+            _remove_media_cache(gid, file_name)
+            log.info("Caption job skipped deleted file[%s/%s]", gid, file_name)
+            return None
         fail_caption_job(db_path, file_name, str(exc))
         log.warning("Caption job failed[%s/%s]: %s", gid, file_name, exc)
         return {"ok": False, "file": file_name, "error": str(exc)}
@@ -845,6 +1211,12 @@ async def _warmup():
     arena_status = _arena_ping()
     if arena_status["reachable"] and arena_status["authed"]:
         log.info("Arena : reachable and authenticated ✓")
+        # Pre-discover vision model so the first caption job doesn't pay the lookup cost
+        try:
+            vm = await asyncio.to_thread(_discover_vision_model)
+            log.info("Arena : vision model for captions = '%s'", vm)
+        except Exception as exc:
+            log.warning("Arena : vision model discovery failed at startup: %s", exc)
     elif arena_status["reachable"]:
         log.warning("Arena : reachable but auth FAILED — check token")
     else:
@@ -1101,12 +1473,14 @@ async def admin_caption_backfill(mp_admin: Optional[str] = Cookie(default=None))
     groups = _load_groups()
     for gid, group in groups.items():
         db_path = _db_path(gid)
-        files = DropboxClient().list_folder(group["folder"])
+        dbx = DropboxClient()
+        files = await _run_blocking(dbx.list_folder, group["folder"])
         names = [
             f["name"] for f in files
             if _ext(f["name"]) in IMAGE_EXTS and not f["name"].startswith("_")
         ]
-        result[gid] = {"queued": enqueue_missing_caption_jobs(db_path, names), "images": len(names)}
+        queued = await _run_blocking(enqueue_missing_caption_jobs, db_path, names)
+        result[gid] = {"queued": queued, "images": len(names)}
     return {"ok": True, "groups": result}
 
 
@@ -1219,8 +1593,8 @@ async def get_event(mp_session: Optional[str] = Cookie(default=None)):
 async def event_online(mp_session: Optional[str] = Cookie(default=None)):
     ctx = _require_auth_ctx(mp_session)
     gid = ctx["group_id"]
-    count = sum(1 for s in _sessions.values() if s.get("group_id") == gid)
-    return {"count": count}
+    count = _active_session_count(gid)
+    return {"count": count, "active_window_minutes": ACTIVE_ONLINE_SECONDS // 60}
 
 @app.get("/api/event/summary")
 async def get_event_summary(mp_session: Optional[str] = Cookie(default=None)):
@@ -1390,8 +1764,7 @@ async def set_nickname(req: Request, mp_session: Optional[str] = Cookie(default=
 
 @app.get("/api/auth/me")
 async def get_me(mp_session: Optional[str] = Cookie(default=None)):
-    if not mp_session or mp_session not in _sessions:
-        raise HTTPException(401, "Not authenticated")
+    _require_auth_ctx(mp_session)
     sess = _sessions[mp_session]
     return {"nickname": sess.get("nickname") or "", "group_id": sess.get("group_id", "default")}
 
@@ -1412,7 +1785,8 @@ async def list_media(mp_session: Optional[str] = Cookie(default=None)):
         log.info("MediaList[%s]: cache HIT — %d files", gid, len(media))
     else:
         t0 = time.time()
-        all_files = DropboxClient().list_folder(folder)
+        dbx = DropboxClient()
+        all_files = await _run_blocking(dbx.list_folder, folder)
         media = [
             f for f in all_files
             if _ext(f["name"]) in MEDIA_EXTS
@@ -1477,11 +1851,19 @@ async def list_media(mp_session: Optional[str] = Cookie(default=None)):
     # Re-sort by effective timestamp (newest first) after joining with DB meta
     media.sort(key=lambda f: f["_sort_ts"], reverse=True)
 
-    # "mine" is session-specific — build a fresh list so we don't store it in the cache
-    result = [
-        {**f, "mine": uploaders.get(f["name"]) == mp_session}
-        for f in media
-    ]
+    # "mine" and uploader info are session-specific — never store in the cache
+    result = []
+    for f in media:
+        uploader_sess = uploaders.get(f["name"])
+        is_mine = uploader_sess == mp_session
+        # Resolve uploader's nickname from the in-memory session store (best-effort)
+        uploader_nick = (_sessions.get(uploader_sess, {}).get("nickname") or "") if uploader_sess else ""
+        result.append({
+            **f,
+            "mine": is_mine,
+            "uploader_nickname": uploader_nick,
+            "uploader_id": uploader_sess[:8] if uploader_sess else "",
+        })
     return {"files": result, "event": event}
 
 
@@ -1509,87 +1891,89 @@ async def upload(
     if ext not in IMAGE_EXTS and (ext not in video_exts or not event.get("allow_video")):
         raise HTTPException(400, "File type not allowed")
 
-    t0 = time.time()
-    content   = await file.read()
-    timings["read"] = time.time() - t0
-    save_name = original_name
+    max_bytes = MAX_PHOTO_UPLOAD_BYTES if ext in IMAGE_EXTS else MAX_VIDEO_UPLOAD_BYTES
+    async with _upload_processing_sem:
+        t0 = time.time()
+        content = await _read_upload_content(file, max_bytes)
+        timings["read"] = time.time() - t0
+        save_name = original_name
 
-    t0 = time.time()
-    if ext in HEIC_EXTS:
-        try:
-            content   = _heic_to_jpeg(content)
-            save_name = original_name[:-(len(ext)+1)] + ".jpg"
-        except Exception as e:
-            raise HTTPException(500, f"HEIC conversion failed: {e}")
-    elif ext in TRANSCODE_EXTS:
-        try:
-            content   = _transcode_to_mp4(content, ext)
-            save_name = original_name[:-(len(ext)+1)] + ".mp4"
-        except subprocess.CalledProcessError as e:
-            raise HTTPException(500, f"Video transcoding failed: {e.stderr.decode()[-200:]}")
-    timings["conversion"] = time.time() - t0
-
-    # Extract EXIF before upload so captured_at can set client_modified on Dropbox
-    db_path = _db_path(gid)
-    client_mod = None
-    lat, lng, captured_at = None, None, None
-    t0 = time.time()
-    if _ext(save_name) in IMAGE_EXTS:
-        lat, lng, captured_at = _extract_exif_gps(content, save_name)
-        log.info("Upload[%s]: lat=%s lng=%s captured_at=%s", save_name, lat, lng, captured_at)
-        if captured_at:
+        t0 = time.time()
+        if ext in HEIC_EXTS:
             try:
-                client_mod = datetime.strptime(captured_at, "%Y:%m:%d %H:%M:%S")
-                log.info("Upload[%s]: setting client_modified = %s", save_name, client_mod)
-            except Exception as exc:
-                log.warning("Upload[%s]: could not parse captured_at '%s': %s",
-                            save_name, captured_at, exc)
-        elif client_modified:
+                content = await _run_blocking(_heic_to_jpeg, content)
+                save_name = original_name[:-(len(ext)+1)] + ".jpg"
+            except Exception as e:
+                raise HTTPException(500, f"HEIC conversion failed: {e}")
+        elif ext in TRANSCODE_EXTS:
             try:
-                client_mod = datetime.fromisoformat(client_modified.replace("Z", "+00:00")).replace(tzinfo=None)
-                captured_at = client_mod.strftime("%Y:%m:%d %H:%M:%S")
-                log.info("Upload[%s]: using browser client_modified = %s", save_name, client_mod)
-            except Exception as exc:
-                log.warning("Upload[%s]: could not parse client_modified '%s': %s",
-                            save_name, client_modified, exc)
-    timings["exif"] = time.time() - t0
+                content = await _run_blocking(_transcode_to_mp4, content, ext)
+                save_name = original_name[:-(len(ext)+1)] + ".mp4"
+            except subprocess.CalledProcessError as e:
+                raise HTTPException(500, f"Video transcoding failed: {e.stderr.decode()[-200:]}")
+        timings["conversion"] = time.time() - t0
 
-    dbx = DropboxClient()
-    t0 = time.time()
-    dbx.upload(f"{folder}/{save_name}", content, client_modified=client_mod)
-    timings["dropbox_upload"] = time.time() - t0
+        # Extract EXIF before upload so captured_at can set client_modified on Dropbox.
+        db_path = _db_path(gid)
+        client_mod = None
+        lat, lng, captured_at = None, None, None
+        t0 = time.time()
+        if _ext(save_name) in IMAGE_EXTS:
+            lat, lng, captured_at = await _run_blocking(_extract_exif_gps, content, save_name)
+            log.info("Upload[%s]: lat=%s lng=%s captured_at=%s", save_name, lat, lng, captured_at)
+            if captured_at:
+                try:
+                    client_mod = datetime.strptime(captured_at, "%Y:%m:%d %H:%M:%S")
+                    log.info("Upload[%s]: setting client_modified = %s", save_name, client_mod)
+                except Exception as exc:
+                    log.warning("Upload[%s]: could not parse captured_at '%s': %s",
+                                save_name, captured_at, exc)
+            elif client_modified:
+                try:
+                    client_mod = datetime.fromisoformat(client_modified.replace("Z", "+00:00")).replace(tzinfo=None)
+                    captured_at = client_mod.strftime("%Y:%m:%d %H:%M:%S")
+                    log.info("Upload[%s]: using browser client_modified = %s", save_name, client_mod)
+                except Exception as exc:
+                    log.warning("Upload[%s]: could not parse client_modified '%s': %s",
+                                save_name, client_modified, exc)
+        timings["exif"] = time.time() - t0
 
-    # Extract video thumbnail
-    t0 = time.time()
-    if _ext(save_name) not in IMAGE_EXTS:
-        try:
-            thumb = _extract_video_frame(content)
-            dbx.upload(f"{folder}/_thumbs/{save_name}.jpg", thumb)
-        except Exception:
-            pass
-    timings["video_thumb"] = time.time() - t0
+        dbx = DropboxClient()
+        t0 = time.time()
+        await _run_blocking(dbx.upload, f"{folder}/{save_name}", content, client_modified=client_mod)
+        timings["dropbox_upload"] = time.time() - t0
 
-    # Save EXIF metadata to DB
-    t0 = time.time()
-    if _ext(save_name) in IMAGE_EXTS:
-        if any(v is not None for v in (lat, lng, captured_at)):
+        # Extract video thumbnail.
+        t0 = time.time()
+        if _ext(save_name) not in IMAGE_EXTS:
             try:
-                set_media_meta(db_path, save_name, lat=lat, lng=lng, captured_at=captured_at)
-                log.info("Upload[%s]: meta saved to DB", save_name)
+                thumb = await _run_blocking(_extract_video_frame, content)
+                await _run_blocking(dbx.upload, f"{folder}/_thumbs/{save_name}.jpg", thumb)
             except Exception as exc:
-                log.error("Upload[%s]: failed to save meta: %s", save_name, exc)
-        else:
-            log.info("Upload[%s]: no EXIF metadata to store", save_name)
-        enqueue_caption_job(db_path, save_name)
-        log.info("Upload[%s]: caption job queued", save_name)
+                log.warning("Upload[%s]: video thumbnail generation failed: %s", save_name, exc)
+        timings["video_thumb"] = time.time() - t0
 
-    # Track uploader for the session-specific "mine" marker in media lists.
-    if mp_session:
-        try:
-            set_uploader_session(db_path, save_name, mp_session)
-        except Exception as exc:
-            log.warning("Upload[%s]: failed to save uploader session: %s", save_name, exc)
-    timings["db"] = time.time() - t0
+        # Save EXIF metadata to DB.
+        t0 = time.time()
+        if _ext(save_name) in IMAGE_EXTS:
+            if any(v is not None for v in (lat, lng, captured_at)):
+                try:
+                    await _run_blocking(set_media_meta, db_path, save_name, lat=lat, lng=lng, captured_at=captured_at)
+                    log.info("Upload[%s]: meta saved to DB", save_name)
+                except Exception as exc:
+                    log.error("Upload[%s]: failed to save meta: %s", save_name, exc)
+            else:
+                log.info("Upload[%s]: no EXIF metadata to store", save_name)
+            await _run_blocking(enqueue_caption_job, db_path, save_name)
+            log.info("Upload[%s]: caption job queued", save_name)
+
+        # Track uploader for the session-specific "mine" marker in media lists.
+        if mp_session:
+            try:
+                await _run_blocking(set_uploader_session, db_path, save_name, mp_session)
+            except Exception as exc:
+                log.warning("Upload[%s]: failed to save uploader session: %s", save_name, exc)
+        timings["db"] = time.time() - t0
 
     modified = (client_mod or datetime.utcnow()).isoformat()
     _upsert_media_cache(gid, {"name": save_name, "size": len(content), "modified": modified})
@@ -1625,7 +2009,7 @@ async def delete_media(filename: str, mp_session: Optional[str] = Cookie(default
 
     dbx = DropboxClient()
     try:
-        deleted = dbx.delete(f"{folder}/{filename}", missing_ok=True)
+        deleted = await _run_blocking(dbx.delete, f"{folder}/{filename}", missing_ok=True)
         if deleted:
             log.info("Delete[%s/%s]: removed from Dropbox by session %s", gid, filename, mp_session)
         else:
@@ -1635,11 +2019,11 @@ async def delete_media(filename: str, mp_session: Optional[str] = Cookie(default
         raise HTTPException(500, "Failed to delete file from storage")
 
     try:
-        dbx.delete(f"{folder}/_thumbs/{filename}.jpg", missing_ok=True)
+        await _run_blocking(dbx.delete, f"{folder}/_thumbs/{filename}.jpg", missing_ok=True)
     except Exception as exc:
         log.warning("Delete[%s/%s]: thumbnail cleanup failed: %s", gid, filename, exc)
 
-    delete_file_data(db_path, filename)
+    await _run_blocking(delete_file_data, db_path, filename)
     _remove_media_cache(gid, filename)
 
     await _broadcast(gid, {"type": "delete", "file": filename, "ts": time.time()})
@@ -1661,24 +2045,7 @@ async def get_thumb(filename: str, mp_session: Optional[str] = Cookie(default=No
         pass
 
     if cache_key not in _thumb_cache:
-        dbx = DropboxClient()
-        if _ext(filename) in IMAGE_EXTS:
-            try:
-                data = dbx.get_thumbnail(f"{folder}/{filename}")
-            except Exception:
-                raw, _ = dbx.download(f"{folder}/{filename}")
-                from PIL import Image
-                img = Image.open(io.BytesIO(raw)); img.thumbnail((640, 640))
-                buf = io.BytesIO(); img.save(buf, format="JPEG"); data = buf.getvalue()
-        else:
-            try:
-                data, _ = dbx.download(f"{folder}/_thumbs/{filename}.jpg")
-            except Exception:
-                missing_key = f"{cache_key}:missing"
-                if _missing_thumb_cache.get(missing_key, 0) < time.time():
-                    log.info("Thumb[%s]: video thumbnail missing; serving placeholder", filename)
-                    _missing_thumb_cache[missing_key] = time.time() + 3600
-                data = _video_placeholder_thumb(filename)
+        data = await _run_blocking(_load_thumb_data_sync, folder, filename, cache_key)
         _thumb_cache[cache_key] = data
 
     return StreamingResponse(
@@ -1781,15 +2148,21 @@ async def get_exif(filename: str, mp_session: Optional[str] = Cookie(default=Non
     if _ext(filename) not in IMAGE_EXTS:
         return {"lat": None, "lng": None, "captured_at": None, "caption": None}
     try:
-        content, _ = DropboxClient().download(f"{folder}/{filename}")
-        lat, lng, captured_at = _extract_exif_gps(content, filename)
+        dbx = DropboxClient()
+        content, _ = await _run_blocking(dbx.download, f"{folder}/{filename}")
+        lat, lng, captured_at = await _run_blocking(_extract_exif_gps, content, filename)
         log.info("exif-endpoint[%s]: lat=%s lng=%s captured_at=%s", filename, lat, lng, captured_at)
         if any(v is not None for v in (lat, lng, captured_at)):
-            set_media_meta(_db_path(gid), filename, lat=lat, lng=lng, captured_at=captured_at)
+            await _run_blocking(set_media_meta, _db_path(gid), filename, lat=lat, lng=lng, captured_at=captured_at)
         return {"lat": lat, "lng": lng, "captured_at": captured_at,
                 "caption": meta.get("caption") if meta else None}
     except Exception as exc:
-        log.warning("exif-endpoint[%s]: failed: %s", filename, exc)
+        if "not_found" in str(exc).lower():
+            log.info("exif-endpoint[%s]: file deleted from Dropbox — evicting from cache", filename)
+            await _run_blocking(delete_file_data, _db_path(gid), filename)
+            _remove_media_cache(gid, filename)
+        else:
+            log.warning("exif-endpoint[%s]: failed: %s", filename, exc)
         return {"lat": None, "lng": None, "captured_at": None, "caption": None}
 
 @app.post("/api/media/{filename}/caption")
@@ -1832,7 +2205,7 @@ async def media_feed(mp_session: Optional[str] = Cookie(default=None)):
     async def event_stream():
         try:
             # Send initial online count
-            count = sum(1 for s in _sessions.values() if s.get("group_id") == gid)
+            count = _active_session_count(gid)
             yield f"data: {json.dumps({'type': 'online', 'count': count})}\n\n"
 
             while True:
@@ -1840,7 +2213,8 @@ async def media_feed(mp_session: Optional[str] = Cookie(default=None)):
                     msg = await asyncio.wait_for(queue.get(), timeout=25)
                     yield msg
                 except asyncio.TimeoutError:
-                    yield ": ping\n\n"
+                    count = _active_session_count(gid)
+                    yield f"data: {json.dumps({'type': 'online', 'count': count})}\n\n"
         finally:
             try: _sse_queues.remove(entry)
             except ValueError: pass
@@ -1852,23 +2226,55 @@ async def media_feed(mp_session: Optional[str] = Cookie(default=None)):
     )
 
 
+# ── API: music clips ─────────────────────────────────────────────────────────
+
+@app.get("/api/music/list")
+async def list_music(mp_session: Optional[str] = Cookie(default=None)):
+    """Return the four music moods and whether their clip files exist on disk."""
+    _require_auth_ctx(mp_session)
+    return {"tracks": [
+        {"key": k, "label": v["label"], "available": (MUSIC_DIR / v["file"]).exists()}
+        for k, v in MUSIC_TRACKS.items()
+    ]}
+
+
+@app.get("/api/music/{track}")
+async def stream_music(track: str, mp_session: Optional[str] = Cookie(default=None)):
+    """Stream a music clip WAV for in-browser preview."""
+    _require_auth_ctx(mp_session)
+    if track not in MUSIC_TRACKS:
+        raise HTTPException(404, "Unknown music track")
+    path = MUSIC_DIR / MUSIC_TRACKS[track]["file"]
+    if not path.exists():
+        raise HTTPException(404, "Music file not found — run: python scripts/gen_music.py")
+    return FileResponse(str(path), media_type="audio/wav",
+                        headers={"Cache-Control": "public, max-age=86400"})
+
+
 # ── API: highlight video ──────────────────────────────────────────────────────
+# Generated videos are uploaded to Dropbox and treated like any other media file:
+# they appear in the gallery and can be viewed, downloaded, or deleted via the
+# standard media endpoints.
 
 @app.post("/api/media/highlight-video")
-async def highlight_video(req: Request, mp_session: Optional[str] = Cookie(default=None)):
+async def create_highlight_video(req: Request, mp_session: Optional[str] = Cookie(default=None)):
     ctx    = _require_auth_ctx(mp_session)
     gid    = ctx["group_id"]
     folder = ctx["folder"]
     body   = await req.json()
-    selected = [f for f in body.get("files", []) if _ext(f) in IMAGE_EXTS]
+    requested = body.get("files", [])
+    music_key = (body.get("music") or "").strip()
+    selected = [f for f in requested if _ext(f) in IMAGE_EXTS]
 
     if not selected:
+        if requested:
+            raise HTTPException(400, "No valid image files selected")
         # Auto-select: top images by reactions + views
         lc = _list_caches.get(gid, {}).get("data", [])
         db = _db_path(gid)
-        names    = [f["name"] for f in lc if _ext(f["name"]) in IMAGE_EXTS]
-        reacts   = get_reactions_by_file(db, names)
-        views    = get_view_counts(db, names)
+        names  = [f["name"] for f in lc if _ext(f["name"]) in IMAGE_EXTS]
+        reacts = get_reactions_by_file(db, names)
+        views  = get_view_counts(db, names)
         def score(n):
             r = sum(reacts.get(n, {}).values())
             v = views.get(n, 0)
@@ -1878,69 +2284,68 @@ async def highlight_video(req: Request, mp_session: Optional[str] = Cookie(defau
     if not selected:
         raise HTTPException(400, "No photos available for highlight video")
 
-    dbx    = DropboxClient()
-    tmp_images = []
+    # Resolve music file path (None = silent)
+    music_path_local: str | None = None
+    if music_key and music_key in MUSIC_TRACKS:
+        p = MUSIC_DIR / MUSIC_TRACKS[music_key]["file"]
+        if p.exists():
+            music_path_local = str(p)
+        else:
+            log.warning("Highlight: music '%s' requested but file missing — silent fallback", music_key)
+
+    # Generate the video to a local temp file
     try:
-        for name in selected[:20]:
-            content, _ = dbx.download(f"{folder}/{name}")
-            tmp = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
-            tmp.write(content); tmp.close()
-            tmp_images.append(tmp.name)
-
-        if not tmp_images:
-            raise HTTPException(400, "Could not download any images")
-
-        out_path = tempfile.mktemp(suffix=".mp4")
-
-        # Build ffmpeg concat filter
-        inputs = []
-        for p in tmp_images:
-            inputs += ["-loop", "1", "-t", "3", "-i", p]
-
-        fparts = []
-        for i in range(len(tmp_images)):
-            fparts.append(
-                f"[{i}:v]scale=1080:1080:force_original_aspect_ratio=decrease,"
-                f"pad=1080:1080:(ow-iw)/2:(oh-ih)/2,setsar=1[v{i}]"
-            )
-        concat_in = "".join(f"[v{i}]" for i in range(len(tmp_images)))
-        fparts.append(f"{concat_in}concat=n={len(tmp_images)}:v=1:a=0[outv]")
-        filter_complex = ";".join(fparts)
-
-        cmd = (["ffmpeg", "-y"] + inputs +
-               ["-filter_complex", filter_complex, "-map", "[outv]",
-                "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-                "-movflags", "+faststart", out_path])
-
-        subprocess.run(cmd, check=True, capture_output=True, timeout=180)
-
-        def _stream_and_cleanup():
-            try:
-                with open(out_path, "rb") as f:
-                    while chunk := f.read(65536):
-                        yield chunk
-            finally:
-                for p in tmp_images + [out_path]:
-                    try: os.unlink(p)
-                    except Exception: pass
-
-        return StreamingResponse(
-            _stream_and_cleanup(),
-            media_type="video/mp4",
-            headers={"Content-Disposition": 'attachment; filename="highlight.mp4"'},
+        out_path, tmp_images = await _run_blocking(
+            _create_highlight_video_sync, folder, selected, music_path_local
         )
-    except HTTPException:
-        raise
     except subprocess.CalledProcessError as e:
-        for p in tmp_images:
-            try: os.unlink(p)
-            except Exception: pass
         raise HTTPException(500, f"ffmpeg failed: {e.stderr.decode()[-300:]}")
+    except ValueError as e:
+        raise HTTPException(400, str(e))
     except Exception as e:
-        for p in tmp_images:
+        raise HTTPException(500, str(e))
+
+    # Upload to Dropbox under a timestamped name, then clean up temp files
+    ts        = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    save_name = f"highlight_{ts}.mp4"
+    try:
+        with open(out_path, "rb") as fh:
+            content = fh.read()
+
+        dbx = DropboxClient()
+        await _run_blocking(dbx.upload, f"{folder}/{save_name}", content)
+
+        # Generate and upload a thumbnail so the gallery shows a preview frame
+        try:
+            thumb = await _run_blocking(_extract_video_frame, content)
+            await _run_blocking(dbx.upload, f"{folder}/_thumbs/{save_name}.jpg", thumb)
+        except Exception as exc:
+            log.warning("Highlight[%s]: thumbnail generation failed: %s", save_name, exc)
+
+        # Mark the creator so the file shows "mine" in their gallery view
+        db_path = _db_path(gid)
+        if mp_session:
+            await _run_blocking(set_uploader_session, db_path, save_name, mp_session)
+
+    except Exception as e:
+        raise HTTPException(500, f"Dropbox upload failed: {e}")
+    finally:
+        for p in tmp_images + [out_path]:
             try: os.unlink(p)
             except Exception: pass
-        raise HTTPException(500, str(e))
+
+    # Insert into the media list cache and notify all clients (same as a regular upload)
+    modified = datetime.utcnow().isoformat()
+    _upsert_media_cache(gid, {"name": save_name, "size": len(content), "modified": modified})
+    sess = _sessions.get(mp_session, {})
+    await _broadcast(gid, {
+        "type": "upload",
+        "file": save_name,
+        "nickname": sess.get("nickname") or "Someone",
+        "ts": time.time(),
+    })
+    log.info("Highlight video '%s' uploaded to Dropbox (%d photos)", save_name, len(selected))
+    return {"ok": True, "file": save_name}
 
 
 # ── API: download / stream ────────────────────────────────────────────────────
@@ -1950,20 +2355,21 @@ async def download_zip(req: Request, mp_session: Optional[str] = Cookie(default=
     ctx       = _require_auth_ctx(mp_session)
     folder    = ctx["folder"]
     body      = await req.json()
-    filenames = [f for f in body.get("files", []) if _ext(f) in MEDIA_EXTS]
+    filenames = list(dict.fromkeys(f for f in body.get("files", []) if _ext(f) in MEDIA_EXTS))
     if not filenames:
         raise HTTPException(400, "No valid files specified")
-    dbx = DropboxClient()
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        for name in filenames:
-            try:
-                content, _ = dbx.download(f"{folder}/{name}"); zf.writestr(name, content)
-            except Exception:
-                pass
-    buf.seek(0)
-    return StreamingResponse(buf, media_type="application/zip",
-        headers={"Content-Disposition": 'attachment; filename="media.zip"'})
+    if len(filenames) > MAX_ZIP_FILES:
+        raise HTTPException(400, f"Too many files selected. Limit is {MAX_ZIP_FILES}.")
+    try:
+        zip_path = await _run_blocking(_build_zip_file_sync, folder, filenames)
+    except ValueError as exc:
+        raise HTTPException(413, str(exc))
+    return FileResponse(
+        zip_path,
+        media_type="application/zip",
+        filename="media.zip",
+        background=BackgroundTask(lambda p: os.path.exists(p) and os.remove(p), zip_path),
+    )
 
 @app.get("/api/media/{filename}/link")
 async def get_media_link(filename: str, mp_session: Optional[str] = Cookie(default=None)):
@@ -1971,7 +2377,8 @@ async def get_media_link(filename: str, mp_session: Optional[str] = Cookie(defau
     ctx    = _require_auth_ctx(mp_session)
     folder = ctx["folder"]
     try:
-        url = DropboxClient().get_temporary_link(f"{folder}/{filename}")
+        dbx = DropboxClient()
+        url = await _run_blocking(dbx.get_temporary_link, f"{folder}/{filename}")
         return {"url": url}
     except Exception as e:
         raise HTTPException(500, f"Could not get temporary link: {e}")
@@ -1980,7 +2387,8 @@ async def get_media_link(filename: str, mp_session: Optional[str] = Cookie(defau
 async def download_media(filename: str, mp_session: Optional[str] = Cookie(default=None)):
     ctx    = _require_auth_ctx(mp_session)
     folder = ctx["folder"]
-    stream, mime = DropboxClient().download_stream(f"{folder}/{filename}")
+    dbx = DropboxClient()
+    stream, mime = await _run_blocking(dbx.download_stream, f"{folder}/{filename}")
     return StreamingResponse(stream, media_type=mime,
         headers={"Content-Disposition": f'attachment; filename="{filename.replace(chr(34),"")}"'})
 

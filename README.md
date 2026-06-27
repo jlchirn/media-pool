@@ -86,6 +86,26 @@ python run.py
 Open the admin QR page shown in the terminal. For phone access, open the LAN
 address printed by the server from a device on the same Wi-Fi network.
 
+## Running On Azure VM
+
+Start the server with:
+
+```bash
+python -m run
+```
+
+If the VM has a public IPv4 address, the launcher prints an `Azure public URL`.
+Open that URL from the admin browser so generated QR codes use the same reachable
+host. For a stable deployment, set `PUBLIC_URL` in `.env`:
+
+```env
+PUBLIC_URL=http://your-public-ip-or-domain:7000
+```
+
+Use `https://` only after configuring a reverse proxy or certificate. Also allow
+inbound TCP traffic for the app port in both the Azure network security group
+and Windows Firewall.
+
 ## Project Structure
 
 ```text
