@@ -65,10 +65,19 @@ def _get_azure_public_ips():
     except Exception:
         return ips
 
-    for iface in data.get("interface", []):
+    # Querying the ".../network/interface" sub-path returns the interface
+    # array directly, not wrapped in {"interface": [...]} — handle both
+    # shapes in case a different api-version ever nests it again.
+    interfaces = data if isinstance(data, list) else data.get("interface", [])
+    for iface in interfaces:
         for ip_config in iface.get("ipv4", {}).get("ipAddress", []):
-            public_ips = ip_config.get("publicIpAddress", [])
-            if isinstance(public_ips, dict):
+            public_ips = ip_config.get("publicIpAddress")
+            if not public_ips:
+                continue
+            # Azure normally returns a plain string here (e.g. "20.1.2.3"), not a
+            # dict or list — wrap non-list values so we don't iterate a string
+            # character-by-character below.
+            if not isinstance(public_ips, list):
                 public_ips = [public_ips]
             for public_ip in public_ips:
                 if isinstance(public_ip, dict):
