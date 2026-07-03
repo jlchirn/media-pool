@@ -45,7 +45,12 @@
     <div class="flex-1 min-w-0">
       <h1 class="font-semibold truncate" :class="deviceClass==='desktop'?'text-xl':'text-base'"
           x-text="event.name || 'Media Pool'"></h1>
-      <p x-show="nickname" class="text-xs text-gray-500 leading-none mt-0.5"
+      <p x-show="hasBackgroundOp" class="text-xs text-gray-500 leading-none mt-0.5 flex items-center gap-1">
+        <span class="animate-spin inline-block text-[10px]">↻</span>
+        <span x-show="highlightGenerating">Generating highlight video…</span>
+        <span x-show="zipping">Preparing ZIP…</span>
+      </p>
+      <p x-show="nickname && !hasBackgroundOp" class="text-xs text-gray-500 leading-none mt-0.5"
          x-text="'Hi, ' + nickname"></p>
     </div>
 
@@ -56,8 +61,21 @@
           <span x-text="files.length + ' items'"></span>
           <span x-show="onlineCount>1" x-text="' · '+onlineCount+' active'" class="text-green-600"></span>
         </span>
-        <!-- Highlight video -->
-        <div class="relative" x-show="files.filter(f=>isImage(f.name)).length>0">
+        <button @click="selectMode=true;selected=null"
+                class="text-gray-400 hover:text-white text-sm transition"
+                x-show="files.length>0">Group</button>
+        <button @click="logout()" class="text-gray-400 hover:text-white text-sm transition">Leave</button>
+      </div>
+    </template>
+    <template x-if="selectMode">
+      <div class="flex items-center gap-3 flex-shrink-0">
+        <span class="text-sm text-gray-300" x-text="Object.keys(selectedFiles).length+' selected'"></span>
+        <button @click="selectedFiles={}" class="text-xs text-gray-500 hover:text-white transition underline">
+          Clear
+        </button>
+
+        <!-- Highlight video (uses current selection, or auto-picks top photos if none selected) -->
+        <div class="relative">
           <button @click="showMusicPicker=!showMusicPicker; if(showMusicPicker && !musicTracks.length) loadMusicTracks()"
                   :disabled="highlightGenerating"
                   class="text-gray-400 hover:text-white transition disabled:opacity-30 text-base"
@@ -75,7 +93,7 @@
                class="absolute top-9 right-0 z-50 bg-gray-900 border border-gray-700 rounded-xl shadow-2xl p-4 w-72">
             <div class="text-white text-sm font-semibold mb-3">🎵 Select background music</div>
 
-            <!-- Four mood chips -->
+            <!-- Mood chips + any custom .mp3 tracks dropped in server/music -->
             <div class="grid grid-cols-2 gap-2 mb-2">
               <template x-for="t in musicTracks.filter(t=>t.available)" :key="t.key">
                 <div @click="musicTrack=t.key"
@@ -98,6 +116,23 @@
               <span class="text-gray-400 text-sm">🔇 No music (silent)</span>
             </div>
 
+            <!-- Length slider (30s – 3min) -->
+            <div class="mb-3">
+              <div class="flex items-center justify-between text-xs text-gray-400 mb-1">
+                <span>⏱ Length</span>
+                <span x-text="highlightDuration>=60
+                  ? (highlightDuration/60).toFixed(highlightDuration%60===0?0:1)+' min'
+                  : highlightDuration+' s'"></span>
+              </div>
+              <input type="range" min="30" max="180" step="15"
+                     x-model.number="highlightDuration"
+                     class="w-full accent-indigo-500">
+            </div>
+
+            <p x-show="selectedImageKeys.length===0" class="text-xs text-gray-500 mb-3">
+              No photos selected — top-rated photos will be picked automatically.
+            </p>
+
             <!-- Generate button -->
             <button @click="generateHighlight()"
                     :disabled="highlightGenerating"
@@ -106,19 +141,17 @@
             </button>
           </div>
         </div>
-        <button @click="selectMode=true;selected=null"
-                class="text-gray-400 hover:text-white text-sm transition"
-                x-show="files.length>0">Select</button>
-        <button @click="logout()" class="text-gray-400 hover:text-white text-sm transition">Leave</button>
-      </div>
-    </template>
-    <template x-if="selectMode">
-      <div class="flex items-center gap-3 flex-shrink-0">
-        <span class="text-sm text-gray-300" x-text="Object.keys(selectedFiles).length+' selected'"></span>
-        <button @click="selectedFiles={}" class="text-xs text-gray-500 hover:text-white transition underline">
-          Clear
+
+        <!-- Download ZIP (acts on current selection) -->
+        <button @click="downloadZip()"
+                :disabled="zipping || Object.keys(selectedFiles).length===0"
+                class="text-gray-400 hover:text-white transition disabled:opacity-30 text-base"
+                title="Download selection as ZIP">
+          <span x-show="!zipping">⬇</span>
+          <span x-show="zipping" class="animate-spin inline-block text-sm">↻</span>
         </button>
-        <button @click="selectMode=false;selectedFiles={}"
+
+        <button @click="selectMode=false;selectedFiles={};showMusicPicker=false"
                 class="flex items-center gap-1 bg-white/10 hover:bg-white/20 text-white text-sm
                        px-3 py-1 rounded-full transition">
           ✕ Cancel
@@ -386,14 +419,6 @@
               class="text-xs text-indigo-400 hover:text-indigo-300 underline transition">All</button>
       <button @click="selectedFiles={}"
               class="text-xs text-gray-500 hover:text-gray-300 underline transition">None</button>
-      <button @click="downloadZip()"
-              :disabled="zipping || Object.keys(selectedFiles).length===0"
-              class="flex items-center gap-1.5 bg-indigo-600 hover:bg-indigo-700
-                     disabled:opacity-40 text-white font-medium text-sm px-4 py-1.5
-                     rounded-full transition">
-        <span x-show="!zipping">↓ Download ZIP</span>
-        <span x-show="zipping" class="animate-spin">↻</span>
-      </button>
     </div>
   </div>
 
@@ -762,6 +787,7 @@
         showMusicPicker: false,
         musicTrack: 'lively',
         musicTracks: [],
+        highlightDuration: 60,
         _musicAudio: null,
 
         // ── Computed ─────────────────────────────────────────────
@@ -813,6 +839,14 @@
 
         get filesWithGPS() {
           return this.files.filter(f=>f.lat!=null&&f.lng!=null);
+        },
+
+        get selectedImageKeys() {
+          return Object.keys(this.selectedFiles).filter(n=>this.isImage(n));
+        },
+
+        get hasBackgroundOp() {
+          return this.highlightGenerating || this.zipping;
         },
 
         // ── Init ─────────────────────────────────────────────────
@@ -1487,6 +1521,10 @@
           const keys=Object.keys(this.selectedFiles);
           if(this.zipping||!keys.length) return;
           this.zipping=true;
+          // Run in the background: leave Group mode immediately so the user can
+          // keep browsing/reacting while the ZIP is prepared.
+          this.selectMode=false;
+          this.selectedFiles={};
           try {
             const r=await fetch('/api/media/download-zip',{
               method:'POST',headers:{'Content-Type':'application/json'},
@@ -1498,7 +1536,8 @@
             const a=document.createElement('a');
             a.href=url; a.download='media.zip'; a.click();
             URL.revokeObjectURL(url);
-          } catch(e){ alert('Download failed: '+e.message); }
+            this._showToast(`✅ ZIP with ${keys.length} file${keys.length>1?'s':''} downloaded`);
+          } catch(e){ this._showToast('❌ Download failed: '+e.message); }
           finally{ this.zipping=false; }
         },
 
@@ -1532,13 +1571,21 @@
         async loadMusicTracks() {
           try {
             const r = await fetch('/api/music/list');
-            if (r.ok) { const d = await r.json(); this.musicTracks = d.tracks; }
+            if (r.ok) {
+              const d = await r.json();
+              this.musicTracks = d.tracks;
+              const current = this.musicTracks.find(t=>t.key===this.musicTrack);
+              if (!current || !current.available) {
+                const firstAvailable = this.musicTracks.find(t=>t.available);
+                this.musicTrack = firstAvailable ? firstAvailable.key : '';
+              }
+            }
           } catch(e) {}
         },
 
         previewMusic(key) {
           this.stopMusicPreview();
-          const a = new Audio(`/api/music/${key}`);
+          const a = new Audio(`/api/music/${encodeURIComponent(key)}`);
           a.volume = 0.5;
           a.play().catch(() => {});
           this._musicAudio = a;
@@ -1551,19 +1598,23 @@
 
         async generateHighlight() {
           if(this.highlightGenerating) return;
+          // Snapshot the selection before clearing it below — selectedImageKeys
+          // is derived from selectedFiles, which we're about to reset.
+          const files = this.selectedImageKeys;
+          const music = this.musicTrack || null;
+          const duration = this.highlightDuration;
           this.showMusicPicker = false;
           this.stopMusicPreview();
+          // Run in the background: leave Group mode immediately so the user can
+          // keep browsing/reacting while the video renders.
+          this.selectMode = false;
+          this.selectedFiles = {};
           this.highlightGenerating = true;
-          const toastId = Date.now();
-          const moodLabel = this.musicTracks.find(t=>t.key===this.musicTrack)?.label || '';
-          const msg = moodLabel ? `🎬 Generating highlight video (${moodLabel})…` : '🎬 Generating highlight video…';
-          this.toasts.push({id:toastId, msg});
           try {
             const r = await fetch('/api/media/highlight-video', {
               method:'POST', headers:{'Content-Type':'application/json'},
-              body: JSON.stringify({files:[], music: this.musicTrack || null}),
+              body: JSON.stringify({files, music, duration}),
             });
-            this.toasts = this.toasts.filter(t=>t.id!==toastId);
             if(!r.ok) {
               const err = await r.json().catch(()=>({detail:'Failed'}));
               this._showToast('❌ '+err.detail); return;
@@ -1571,7 +1622,6 @@
             const data = await r.json();
             this._showToast(`✅ Highlight video "${data.file}" added to gallery`);
           } catch(e) {
-            this.toasts = this.toasts.filter(t=>t.id!==toastId);
             this._showToast('❌ '+e.message);
           } finally { this.highlightGenerating = false; }
         },

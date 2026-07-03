@@ -4,6 +4,7 @@ import io
 import json
 import logging
 import os
+import random
 import secrets
 import sqlite3
 import subprocess
@@ -120,6 +121,21 @@ def _env_int(name: str, default: int, minimum: int = 0) -> int:
     return value
 
 
+def _env_float(name: str, default: float, minimum: float = 0.0) -> float:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        log.warning("%s=%r is not a number; using %s", name, raw, default)
+        return default
+    if value < minimum:
+        log.warning("%s=%s is below minimum %s; using %s", name, value, minimum, default)
+        return default
+    return value
+
+
 SECRET_KEY     = os.getenv("SECRET_KEY", "").strip()
 if not SECRET_KEY:
     allow_temp_secret = os.getenv("ALLOW_TEMP_SECRET_KEY", "").strip().lower() in {"1", "true", "yes", "on"}
@@ -145,7 +161,14 @@ MAX_VIDEO_UPLOAD_BYTES = _env_int("MAX_VIDEO_UPLOAD_MB", 500, 1) * 1024 * 1024
 MAX_ZIP_FILES = _env_int("MAX_ZIP_FILES", 50, 1)
 MAX_ZIP_TOTAL_BYTES = _env_int("MAX_ZIP_TOTAL_MB", 1024, 1) * 1024 * 1024
 MAX_HIGHLIGHT_FILES = _env_int("MAX_HIGHLIGHT_FILES", 20, 1)
-HIGHLIGHT_FFMPEG_TIMEOUT_SECONDS = _env_int("HIGHLIGHT_FFMPEG_TIMEOUT_SECONDS", 180, 30)
+HIGHLIGHT_FFMPEG_TIMEOUT_SECONDS = _env_int("HIGHLIGHT_FFMPEG_TIMEOUT_SECONDS", 600, 30)
+HIGHLIGHT_MIN_SECONDS = 30
+HIGHLIGHT_MAX_SECONDS = 180
+HIGHLIGHT_DEFAULT_SECONDS = 60
+HIGHLIGHT_MIN_PER_IMAGE_SECONDS = 1.5
+HIGHLIGHT_MAX_PER_IMAGE_SECONDS = 12.0
+HIGHLIGHT_TRANSITION_SECONDS = _env_float("HIGHLIGHT_TRANSITION_SECONDS", 0.75, 0.0)
+HIGHLIGHT_AUDIO_FADE_SECONDS = _env_float("HIGHLIGHT_AUDIO_FADE_SECONDS", 4.0, 0.0)
 
 MUSIC_DIR = Path(__file__).parent / "music"
 MUSIC_TRACKS: dict[str, dict] = {
@@ -154,6 +177,24 @@ MUSIC_TRACKS: dict[str, dict] = {
     "serene":  {"label": "幽美", "file": "serene.wav"},
     "dynamic": {"label": "動感", "file": "dynamic.wav"},
 }
+
+
+CUSTOM_MUSIC_EXTS = {".mp3", ".wav", ".m4a", ".ogg", ".flac", ".aac"}
+
+
+def _all_music_tracks() -> dict[str, dict]:
+    """List every playable track in MUSIC_DIR: the built-in mood clips (with their
+    curated labels) plus any other audio file the owner drops into the folder."""
+    tracks = dict(MUSIC_TRACKS)
+    known_files = {v["file"] for v in MUSIC_TRACKS.values()}
+    if MUSIC_DIR.exists():
+        for p in sorted(MUSIC_DIR.iterdir()):
+            if not p.is_file() or p.name in known_files:
+                continue
+            if p.suffix.lower() not in CUSTOM_MUSIC_EXTS:
+                continue
+            tracks[f"custom:{p.stem}"] = {"label": p.stem, "file": p.name}
+    return tracks
 
 MEDIA_EXTS     = {"jpg","jpeg","png","gif","webp","heic","heif","mp4","mov","avi","m4v"}
 IMAGE_EXTS     = {"jpg","jpeg","png","gif","webp","heic","heif"}
@@ -732,11 +773,15 @@ def _build_zip_file_sync(folder: str, filenames: list[str]) -> str:
 
 
 def _create_highlight_video_sync(
-    folder: str, selected: list[str], music_path: str | None = None
+    folder: str, selected: list[str], music_path: str | None = None,
+    target_seconds: int = HIGHLIGHT_DEFAULT_SECONDS,
 ) -> tuple[str, list[str]]:
     """Download selected images from Dropbox, encode an MP4 with ffmpeg, and return
     (out_path, tmp_input_paths).  Caller is responsible for deleting both.
-    If music_path is given, the audio track is looped and mixed into the output."""
+    If music_path is given, the audio track is looped and mixed into the output.
+    target_seconds is the requested total video length; the per-image display time
+    is derived from it (clamped to a sane range) so the count of selected photos
+    doesn't need to match the requested duration exactly."""
     dbx = DropboxClient()
     tmp_images: list[str] = []
     out_path = ""
@@ -755,10 +800,25 @@ def _create_highlight_video_sync(
         out_path  = out_file.name
         out_file.close()
 
-        # Video inputs (each image shown for 3 s)
+        # Video inputs — per-image duration derived from the requested total length.
+        # Crossfades overlap adjacent stills, so add the overlap back into each
+        # input duration before clamping to the configured per-image range.
+        transition_seconds = HIGHLIGHT_TRANSITION_SECONDS if len(tmp_images) > 1 else 0.0
+        requested_per_image = (
+            (target_seconds + transition_seconds * (len(tmp_images) - 1)) / len(tmp_images)
+        )
+        per_image_seconds = max(
+            HIGHLIGHT_MIN_PER_IMAGE_SECONDS,
+            min(HIGHLIGHT_MAX_PER_IMAGE_SECONDS, requested_per_image),
+        )
+        transition_seconds = min(transition_seconds, max(0.0, per_image_seconds - 0.25))
+        video_seconds = (
+            per_image_seconds * len(tmp_images)
+            - transition_seconds * max(0, len(tmp_images) - 1)
+        )
         inputs_v: list[str] = []
         for path in tmp_images:
-            inputs_v += ["-loop", "1", "-t", "3", "-i", path]
+            inputs_v += ["-loop", "1", "-t", f"{per_image_seconds:.3f}", "-i", path]
 
         # Optional looping audio input
         inputs_a: list[str] = (
@@ -769,24 +829,50 @@ def _create_highlight_video_sync(
         for i in range(len(tmp_images)):
             fparts.append(
                 f"[{i}:v]scale=1080:1080:force_original_aspect_ratio=decrease,"
-                f"pad=1080:1080:(ow-iw)/2:(oh-ih)/2,setsar=1[v{i}]"
+                f"pad=1080:1080:(ow-iw)/2:(oh-ih)/2,setsar=1,"
+                f"fps=24,format=yuv420p[v{i}]"
             )
-        concat_in = "".join(f"[v{i}]" for i in range(len(tmp_images)))
-        fparts.append(f"{concat_in}concat=n={len(tmp_images)}:v=1:a=0[outv]")
+        if len(tmp_images) == 1 or transition_seconds <= 0.01:
+            concat_in = "".join(f"[v{i}]" for i in range(len(tmp_images)))
+            fparts.append(f"{concat_in}concat=n={len(tmp_images)}:v=1:a=0[outv]")
+        else:
+            previous = "v0"
+            for i in range(1, len(tmp_images)):
+                out_label = "outv" if i == len(tmp_images) - 1 else f"xv{i}"
+                offset = (per_image_seconds - transition_seconds) * i
+                fparts.append(
+                    f"[{previous}][v{i}]xfade=transition=fade:"
+                    f"duration={transition_seconds:.3f}:offset={offset:.3f}[{out_label}]"
+                )
+                previous = out_label
+        audio_idx = len(tmp_images)   # index of the music input (if present)
+        if music_path:
+            fade_seconds = min(HIGHLIGHT_AUDIO_FADE_SECONDS, max(0.0, video_seconds / 2))
+            if fade_seconds > 0.01:
+                fade_start = max(0.0, video_seconds - fade_seconds)
+                fparts.append(
+                    f"[{audio_idx}:a]atrim=0:{video_seconds:.3f},"
+                    f"asetpts=PTS-STARTPTS,"
+                    f"afade=t=out:st={fade_start:.3f}:d={fade_seconds:.3f}[outa]"
+                )
+            else:
+                fparts.append(
+                    f"[{audio_idx}:a]atrim=0:{video_seconds:.3f},"
+                    f"asetpts=PTS-STARTPTS[outa]"
+                )
         filter_complex = ";".join(fparts)
 
-        audio_idx = len(tmp_images)   # index of the music input (if present)
         cmd: list[str] = ["ffmpeg", "-y"] + inputs_v + inputs_a + [
             "-filter_complex", filter_complex,
             "-map", "[outv]",
         ]
         if music_path:
-            cmd += [f"-map", f"{audio_idx}:a",
-                    "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+            cmd += [f"-map", "[outa]",
+                    "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
                     "-c:a", "aac", "-b:a", "128k",
-                    "-shortest", "-movflags", "+faststart", out_path]
+                    "-movflags", "+faststart", out_path]
         else:
-            cmd += ["-c:v", "libx264", "-preset", "fast", "-crf", "23",
+            cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
                     "-movflags", "+faststart", out_path]
 
         subprocess.run(cmd, check=True, capture_output=True,
@@ -891,11 +977,51 @@ def _arena_token() -> str | None:
         log.warning("Arena: auto-login failed: %s", exc)
     return None
 
-CAPTION_PROMPT_TEMPLATE = (
-    "Describe this photo in one short, vivid sentence in {language}. "
-    "Use a more specific noun for a place, an animal, a person, etc, "
-    "rather than a general term. No preamble, no label."
+# A pool of caption "personas" — one is picked at random per photo so captions
+# don't all read the same way. Each must still: stay one short sentence, use
+# specific nouns instead of vague ones, and skip any preamble/label.
+CAPTION_PROMPT_TEMPLATES = [
+    # 1. Witty stand-up comedian
+    "You're a witty stand-up comedian riffing on this photo. Describe it in one "
+    "short, funny sentence in {language} — punchy, a little cheeky, with a clever "
+    "twist or joke. Use a specific noun for the place, animal, food, or person "
+    "rather than a general term. No preamble, no label, just the line.",
+    # 2. Overly dramatic movie-trailer narrator
+    "You're the over-the-top narrator of a movie trailer. Describe this photo in "
+    "one short, vivid sentence in {language} as if it's the most epic moment ever "
+    "captured — dramatic, exaggerated, cinematic. Use a specific noun for the "
+    "place, animal, food, or person rather than a general term. No preamble, no label.",
+    # 3. Sarcastic best friend texting a caption
+    "You're texting a friend a sarcastic caption for this photo. Write one short, "
+    "funny sentence in {language} with dry humor or a playful jab, like an inside "
+    "joke. Name the specific place, animal, food, or person rather than using a "
+    "general term. No preamble, no label.",
+    # 4. Gen-Z meme page caption
+    "Write this photo's caption the way a Gen-Z meme page would: one short, "
+    "punchy sentence in {language}, playful and internet-culture funny, maybe a "
+    "lighthearted exaggeration. Use a specific noun for the place, animal, food, "
+    "or person rather than a general term. No preamble, no label, no hashtags.",
+    # 5. Deadpan nature-documentary narrator
+    "You're a nature documentary narrator, deadpan and mock-serious, describing "
+    "this photo as if it captures a rare wildlife behavior. One short, vivid, "
+    "funny sentence in {language}. Use a specific noun for the place, animal, "
+    "food, or person rather than a general term. No preamble, no label.",
+    # 6. Flattering hype friend
+    "You're a supportive friend hyping this photo up. Describe it in one short, "
+    "vivid, warmly flattering sentence in {language} — make the place, animal, "
+    "food, or person sound as impressive and camera-ready as possible. Use a "
+    "specific noun rather than a general term. No preamble, no label.",
+]
+
+# A neutral, low-risk caption prompt used as the guaranteed final retry
+# attempt in _call_arena_caption, so a recognizable photo still gets *a*
+# caption even if every playful persona above gets refused/blocked for it.
+SAFE_CAPTION_PROMPT_TEMPLATE = (
+    "Describe this photo in one short, vivid, neutral sentence in {language}. "
+    "Use a specific noun for a place, animal, food, or person rather than a "
+    "general term. No preamble, no label."
 )
+
 SUMMARY_PROMPT_TEMPLATE = (
     "Write a warm, vivid 2-3 sentence summary of this event in {language}, "
     "based on the following photo captions:\n{captions}\n\nSummary:"
@@ -912,44 +1038,131 @@ _VISION_NAME_HINTS = (
 )
 
 
-def _pick_vision_model_from_list(models: list) -> str | None:
-    """Select the best vision-capable model from an Arena /v1/models response list."""
+def _rank_vision_model_candidates(models: list) -> list[str]:
+    """Return vision-plausible model ids from an Arena /v1/models list, ordered
+    best-first: explicit capability metadata, then name-based heuristics.
+
+    This only ranks candidates by metadata/name — it does not confirm any of
+    them can actually read image bytes. Use _verify_vision_capability for that.
+    """
+    ranked: list[str] = []
+
     # Priority 1: explicit capability fields in the model metadata
     for m in models:
         mid = m.get("id", "")
-        # OpenAI-style modalities field
         modalities = m.get("modalities") or m.get("input_modalities") or []
-        if isinstance(modalities, list) and any(
-            tok in ("image", "vision", "image_url") for tok in modalities
-        ):
-            return mid
-        # Capability object
         caps = m.get("capabilities") or {}
-        if caps.get("vision") or caps.get("image_input"):
-            return mid
-        # Arena may use a "type" or "features" field
         features = m.get("features") or []
-        if isinstance(features, list) and any(
-            tok in ("vision", "image", "multimodal") for tok in features
-        ):
-            return mid
         model_type = m.get("type") or m.get("model_type") or ""
-        if "multimodal" in model_type or "vision" in model_type:
-            return mid
+        has_capability_flag = (
+            (isinstance(modalities, list) and any(tok in ("image", "vision", "image_url") for tok in modalities))
+            or caps.get("vision") or caps.get("image_input")
+            or (isinstance(features, list) and any(tok in ("vision", "image", "multimodal") for tok in features))
+            or "multimodal" in model_type or "vision" in model_type
+        )
+        if has_capability_flag and mid not in ranked:
+            ranked.append(mid)
 
     # Priority 2: name-based heuristics for well-known vision models
     for m in models:
-        mid_lower = m.get("id", "").lower()
-        if any(hint in mid_lower for hint in _VISION_NAME_HINTS):
-            return m["id"]
+        mid = m.get("id", "")
+        if mid not in ranked and any(hint in mid.lower() for hint in _VISION_NAME_HINTS):
+            ranked.append(mid)
 
-    return None
+    return ranked
+
+
+# A tiny solid-color JPEG used to verify a candidate model actually reads
+# image pixels, rather than just matching on its name/metadata and then
+# hallucinating a plausible-sounding but ungrounded caption.
+_VISION_PROBE_B64: str | None = None
+_VISION_PROBE_COLOR_WORD = "red"
+
+
+def _vision_probe_b64() -> str:
+    global _VISION_PROBE_B64
+    if _VISION_PROBE_B64 is None:
+        from PIL import Image
+        # 256x256 — a 64x64 swatch was too trivial and some models returned an
+        # empty completion for it even with headroom in max_tokens; 256x256
+        # confirmed reliable in manual testing against this Arena deployment.
+        img = Image.new("RGB", (256, 256), color=(220, 30, 30))
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=90)
+        _VISION_PROBE_B64 = base64.b64encode(buf.getvalue()).decode()
+    return _VISION_PROBE_B64
+
+
+def _verify_vision_capability(token: str, model: str) -> bool:
+    """Send a known solid-red test image and confirm the model reports red —
+    evidence it's reading pixels, not pattern-matching the model name.
+
+    Retries once after a short pause on 502/503/504 or a transient network
+    error, since those are gateway/infra hiccups (esp. under a burst of probe
+    calls across many candidate models), not proof the model lacks vision.
+    """
+    payload = json.dumps({
+        "model": model,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "What is the single dominant color of "
+                                          "this image? Reply in English with "
+                                          "exactly one color word, nothing else."},
+                {"type": "image_url",
+                 "image_url": {"url": f"data:image/jpeg;base64,{_vision_probe_b64()}"}},
+            ],
+        }],
+        # Some backends (e.g. Azure) reject max_output_tokens < 16 outright (502), and some
+        # models spend tokens on hidden reasoning before the visible answer, so 50 leaves
+        # enough headroom for a one-word answer to actually come through non-empty.
+        "max_tokens": 50,
+    }).encode()
+
+    for attempt in range(2):
+        try:
+            rq = urllib.request.Request(
+                f"{ARENA_URL}/v1/chat/completions",
+                data=payload,
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {token}",
+                    "Connection": "close",
+                },
+            )
+            with urllib.request.urlopen(rq, timeout=20) as resp:
+                body = json.loads(resp.read())
+            answer = body["choices"][0]["message"]["content"].strip().lower()
+            ok = _VISION_PROBE_COLOR_WORD in answer
+            if not ok:
+                log.warning("Vision probe: model '%s' answered %r (expected %r) — "
+                            "likely can't actually see images", model, answer,
+                            _VISION_PROBE_COLOR_WORD)
+            return ok
+        except urllib.request.HTTPError as exc:
+            if exc.code in (502, 503, 504) and attempt == 0:
+                time.sleep(1.0)
+                continue
+            log.warning("Vision probe request failed for model '%s': HTTP %s", model, exc.code)
+            return False
+        except Exception as exc:
+            if attempt == 0:
+                time.sleep(1.0)
+                continue
+            log.warning("Vision probe request failed for model '%s': %s", model, exc)
+            return False
+    return False
 
 
 def _discover_vision_model() -> str:
-    """Query Arena /v1/models, pick a vision-capable model, and cache the result 5 min.
+    """Query Arena /v1/models, pick a model that provably reads image input, and
+    cache the result 5 min.
 
-    Falls back to CAPTION_MODEL if Arena is unreachable or no vision model is found.
+    Ranks candidates by metadata/name (see _rank_vision_model_candidates), then
+    verifies each in order with a real image probe (_verify_vision_capability)
+    instead of trusting the ranking blindly — a model can look vision-capable
+    by name/metadata and still fail to actually process the image. Falls back
+    to CAPTION_MODEL if Arena is unreachable or no candidate passes the probe.
     """
     now = time.time()
     with _vision_model_lock:
@@ -971,15 +1184,24 @@ def _discover_vision_model() -> str:
         if not isinstance(models, list):
             models = []
 
-        chosen = _pick_vision_model_from_list(models)
+        candidates = _rank_vision_model_candidates(models)
+        chosen = None
+        for i, candidate in enumerate(candidates):
+            if i > 0:
+                time.sleep(0.3)  # avoid bursting the gateway with back-to-back probes
+            if _verify_vision_capability(token, candidate):
+                chosen = candidate
+                log.info("Caption: verified vision model '%s' actually reads images "
+                         "(%d candidates considered, %d models available)",
+                         candidate, len(candidates), len(models))
+                break
+
         if not chosen:
-            log.warning("Caption: no vision-capable model found in Arena model list (%d models); "
-                        "using CAPTION_MODEL=%s. Consider setting CAPTION_MODEL explicitly.",
-                        len(models), CAPTION_MODEL)
+            log.warning("Caption: no candidate model passed the vision probe (%d candidates, "
+                        "%d models available); using CAPTION_MODEL=%s. Consider setting "
+                        "CAPTION_MODEL explicitly to a model verified to support image input.",
+                        len(candidates), len(models), CAPTION_MODEL)
             chosen = CAPTION_MODEL
-        else:
-            log.info("Caption: auto-selected vision model '%s' from Arena (%d models available)",
-                     chosen, len(models))
 
         with _vision_model_lock:
             _vision_model_cache["model"] = chosen
@@ -1003,14 +1225,20 @@ def _invalidate_vision_model_cache() -> None:
 def _call_arena_caption(file_name: str, image_bytes: bytes, language: str = "") -> str:
     """Return an AI caption for an image via Arena, or raise for the queue retry policy.
 
-    Retries up to 3 times for quality failures (truncated or too-short captions).
-    Falls back to CAPTION_MODEL_FALLBACK if the primary model returns 422 (no vision).
+    Retries with a *different* persona each attempt — every playful persona in
+    CAPTION_PROMPT_TEMPLATES gets tried once (shuffled order), so a photo that
+    one prompt gets refused/blocked on isn't retried with that same losing
+    prompt. The final attempt always uses SAFE_CAPTION_PROMPT_TEMPLATE — a
+    neutral, low-risk prompt — so every recognizable photo still gets *a*
+    caption. Any failure short of "no Arena token at all" (HTTP errors,
+    gateway 502/503/504, timeouts, malformed responses, quality rejects) just
+    consumes an attempt and moves to the next persona rather than raising —
+    only exhausting every attempt raises.
     """
     token = _arena_token()
     if not token:
         raise RuntimeError("Arena token unavailable")
     lang = language or LANGUAGE
-    caption_prompt = CAPTION_PROMPT_TEMPLATE.format(language=lang)
 
     payload_image = _caption_payload_image(image_bytes)
     b64 = base64.b64encode(payload_image).decode()
@@ -1018,13 +1246,17 @@ def _call_arena_caption(file_name: str, image_bytes: bytes, language: str = "") 
     model = _discover_vision_model()
     max_tokens = 300
 
-    def _do_request(tok: str, mdl: str, mtok: int):
+    persona_order = list(range(len(CAPTION_PROMPT_TEMPLATES)))
+    random.shuffle(persona_order)
+    total_attempts = len(persona_order) + 1  # try every persona once, then 1 guaranteed-safe try
+
+    def _do_request(tok: str, mdl: str, mtok: int, prompt: str):
         payload = json.dumps({
             "model": mdl,
             "messages": [{
                 "role": "user",
                 "content": [
-                    {"type": "text", "text": caption_prompt},
+                    {"type": "text", "text": prompt},
                     {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
                 ],
             }],
@@ -1041,47 +1273,83 @@ def _call_arena_caption(file_name: str, image_bytes: bytes, language: str = "") 
         )
         return urllib.request.urlopen(rq, timeout=60)
 
-    log.info("Caption[%s]: model=%s  lang=%s", file_name, model, lang)
     last_exc: Exception | None = None
 
-    for attempt in range(3):
-        try:
-            try:
-                resp = _do_request(token, model, max_tokens)
-            except urllib.request.HTTPError as e:
-                if e.code == 401:
-                    log.warning("Caption 401 for %s — refreshing token", file_name)
-                    tf = _arena_token_file()
-                    if tf.exists(): tf.unlink()
-                    token = _arena_token()
-                    if not token:
-                        raise RuntimeError("Arena token refresh failed")
-                    resp = _do_request(token, model, max_tokens)
-                elif e.code == 422:
-                    # Model rejected image input — invalidate cache and re-discover
-                    log.warning("Model '%s' rejected image input (HTTP 422) — "
-                                "invalidating model cache and re-discovering", model)
-                    _invalidate_vision_model_cache()
-                    new_model = _discover_vision_model()
-                    if new_model != model:
-                        log.info("Retrying caption with re-discovered model '%s'", new_model)
-                        model = new_model
-                        resp = _do_request(token, model, max_tokens)
-                    else:
-                        raise RuntimeError(
-                            f"No vision-capable model available in Arena (tried '{model}'). "
-                            "Check Arena model list or set CAPTION_MODEL to a vision-capable model."
-                        )
-                else:
-                    raise
-        except Exception as e:
-            log.warning("Arena caption failed for %s: %s", file_name, e)
-            raise
+    for attempt in range(total_attempts):
+        is_last = attempt == total_attempts - 1
+        if is_last:
+            caption_prompt = SAFE_CAPTION_PROMPT_TEMPLATE.format(language=lang)
+            persona_desc = "safe-neutral fallback"
+        else:
+            idx = persona_order[attempt]
+            caption_prompt = CAPTION_PROMPT_TEMPLATES[idx].format(language=lang)
+            persona_desc = f"persona {idx + 1}"
 
-        body = json.loads(resp.read())
-        choice = body["choices"][0]
-        finish_reason = choice.get("finish_reason")
-        caption = choice["message"]["content"].strip()
+        log.info("Caption[%s]: model=%s  lang=%s  attempt=%d/%d  %s",
+                 file_name, model, lang, attempt + 1, total_attempts, persona_desc)
+
+        # Any failure here — HTTP error, gateway hiccup, timeout, malformed
+        # response — costs this attempt but moves on to the next persona
+        # (or the final safe fallback) rather than aborting the whole call.
+        # Only a hard precondition failure (no token at all, see top of
+        # function) should raise immediately; transient/backend errors must
+        # not, since the goal is "every recognizable photo gets a caption."
+        try:
+            resp = _do_request(token, model, max_tokens, caption_prompt)
+        except urllib.request.HTTPError as e:
+            if e.code == 401:
+                tf = _arena_token_file()
+                if tf.exists(): tf.unlink()
+                refreshed = _arena_token()
+                if not refreshed or refreshed == token:
+                    # An explicit ARENA_TOKEN env var always wins in _arena_token(),
+                    # so deleting the cached file can't produce a different value —
+                    # every remaining persona attempt would hit the same 401. Stop
+                    # now instead of burning the whole attempt budget on a dead token.
+                    log.warning("Caption 401 for %s (attempt %d) — token did not change "
+                                "after refresh (ARENA_TOKEN may be a stale static env var); "
+                                "giving up instead of retrying with the same bad token",
+                                file_name, attempt + 1)
+                    raise RuntimeError(
+                        "HTTP 401 and token refresh had no effect — check ARENA_TOKEN "
+                        "in .env (it may be expired/invalid) or unset it to use "
+                        "ARENA_USER/ARENA_PASS auto-login instead."
+                    )
+                log.warning("Caption 401 for %s (attempt %d) — refreshing token, retrying",
+                            file_name, attempt + 1)
+                token = refreshed
+                last_exc = RuntimeError("HTTP 401 (token refreshed)")
+            elif e.code == 422:
+                log.warning("Model '%s' rejected image input (HTTP 422) for %s (attempt %d) — "
+                            "invalidating model cache and re-discovering", model, file_name, attempt + 1)
+                _invalidate_vision_model_cache()
+                model = _discover_vision_model()
+                last_exc = RuntimeError(f"HTTP 422 (model re-discovered as '{model}')")
+            elif e.code in (502, 503, 504):
+                log.warning("Caption gateway error %s for %s (attempt %d) — retrying",
+                            e.code, file_name, attempt + 1)
+                last_exc = RuntimeError(f"Gateway error {e.code}")
+            else:
+                log.warning("Caption HTTP error %s for %s (attempt %d): %s",
+                            e.code, file_name, attempt + 1, e)
+                last_exc = RuntimeError(f"HTTP {e.code}: {e}")
+            continue
+        except Exception as e:
+            log.warning("Caption request failed for %s (attempt %d): %s — retrying",
+                        file_name, attempt + 1, e)
+            last_exc = RuntimeError(f"Request failed: {e}")
+            continue
+
+        try:
+            body = json.loads(resp.read())
+            choice = body["choices"][0]
+            finish_reason = choice.get("finish_reason")
+            caption = choice["message"]["content"].strip()
+        except Exception as e:
+            log.warning("Caption response parse failed for %s (attempt %d): %s",
+                        file_name, attempt + 1, e)
+            last_exc = RuntimeError(f"Response parse failed: {e}")
+            continue
 
         if finish_reason == "length":
             # Response was cut off by the token limit — double the limit and retry
@@ -1091,16 +1359,36 @@ def _call_arena_caption(file_name: str, image_bytes: bytes, language: str = "") 
             last_exc = RuntimeError(f"Caption cut off (finish_reason=length): {caption!r}")
             continue
 
+        if "�" in caption:
+            # A literal replacement character means the raw byte stream was cut off
+            # mid-way through a multi-byte UTF-8 character (common for CJK output
+            # hitting a token limit) — genuine truncation even when the backend
+            # didn't report finish_reason=="length". Same fix: more tokens, retry.
+            log.warning("Caption contains U+FFFD (mid-character cutoff) for %s "
+                        "(attempt %d) — retrying: %r", file_name, attempt + 1, caption)
+            max_tokens = min(max_tokens * 2, 1200)
+            last_exc = RuntimeError(f"Caption truncated mid-character: {caption!r}")
+            continue
+
         if not caption or len(caption) < CAPTION_MIN_CHARS:
             log.warning("Caption too short (%d chars) for %s (attempt %d): %r",
                         len(caption), file_name, attempt + 1, caption)
             last_exc = RuntimeError(f"Caption too short ({len(caption)} chars): {caption!r}")
             continue
 
-        log.info("Caption[%s] ok (model=%s, attempt=%d): %r", file_name, model, attempt + 1, caption[:80])
+        if caption.strip("[]").strip().lower() in ("empty response", "no response"):
+            # Model returned a refusal/placeholder instead of real content — this is
+            # long enough to dodge CAPTION_MIN_CHARS above, so it needs its own check.
+            log.warning("Caption got empty-response sentinel for %s (attempt %d): %r",
+                        file_name, attempt + 1, caption)
+            last_exc = RuntimeError(f"Empty-response sentinel: {caption!r}")
+            continue
+
+        log.info("Caption[%s] ok (model=%s, attempt=%d/%d, %s): %r",
+                 file_name, model, attempt + 1, total_attempts, persona_desc, caption[:80])
         return caption
 
-    raise last_exc or RuntimeError("Caption quality check failed after 3 attempts")
+    raise last_exc or RuntimeError(f"Caption quality check failed after {total_attempts} attempts")
 
 
 # ── Startup warmup ───────────────────────────────────────────────────────────
@@ -2228,26 +2516,36 @@ async def media_feed(mp_session: Optional[str] = Cookie(default=None)):
 
 # ── API: music clips ─────────────────────────────────────────────────────────
 
+MUSIC_MEDIA_TYPES = {
+    ".mp3": "audio/mpeg", ".wav": "audio/wav", ".m4a": "audio/mp4",
+    ".ogg": "audio/ogg", ".flac": "audio/flac", ".aac": "audio/aac",
+}
+
+
 @app.get("/api/music/list")
 async def list_music(mp_session: Optional[str] = Cookie(default=None)):
-    """Return the four music moods and whether their clip files exist on disk."""
+    """Return every track in server/music (built-in moods plus any audio files the
+    owner dropped in), and whether each clip file exists on disk."""
     _require_auth_ctx(mp_session)
+    tracks = _all_music_tracks()
     return {"tracks": [
         {"key": k, "label": v["label"], "available": (MUSIC_DIR / v["file"]).exists()}
-        for k, v in MUSIC_TRACKS.items()
+        for k, v in tracks.items()
     ]}
 
 
 @app.get("/api/music/{track}")
 async def stream_music(track: str, mp_session: Optional[str] = Cookie(default=None)):
-    """Stream a music clip WAV for in-browser preview."""
+    """Stream a music clip for in-browser preview."""
     _require_auth_ctx(mp_session)
-    if track not in MUSIC_TRACKS:
+    tracks = _all_music_tracks()
+    if track not in tracks:
         raise HTTPException(404, "Unknown music track")
-    path = MUSIC_DIR / MUSIC_TRACKS[track]["file"]
+    path = MUSIC_DIR / tracks[track]["file"]
     if not path.exists():
         raise HTTPException(404, "Music file not found — run: python scripts/gen_music.py")
-    return FileResponse(str(path), media_type="audio/wav",
+    media_type = MUSIC_MEDIA_TYPES.get(path.suffix.lower(), "application/octet-stream")
+    return FileResponse(str(path), media_type=media_type,
                         headers={"Cache-Control": "public, max-age=86400"})
 
 
@@ -2266,10 +2564,17 @@ async def create_highlight_video(req: Request, mp_session: Optional[str] = Cooki
     music_key = (body.get("music") or "").strip()
     selected = [f for f in requested if _ext(f) in IMAGE_EXTS]
 
+    try:
+        duration_sec = int(body.get("duration", HIGHLIGHT_DEFAULT_SECONDS))
+    except (TypeError, ValueError):
+        duration_sec = HIGHLIGHT_DEFAULT_SECONDS
+    duration_sec = max(HIGHLIGHT_MIN_SECONDS, min(HIGHLIGHT_MAX_SECONDS, duration_sec))
+
     if not selected:
         if requested:
             raise HTTPException(400, "No valid image files selected")
-        # Auto-select: top images by reactions + views
+        # Auto-select: top images by reactions + views, enough to roughly fill
+        # the requested duration at ~3 s/photo
         lc = _list_caches.get(gid, {}).get("data", [])
         db = _db_path(gid)
         names  = [f["name"] for f in lc if _ext(f["name"]) in IMAGE_EXTS]
@@ -2279,24 +2584,27 @@ async def create_highlight_video(req: Request, mp_session: Optional[str] = Cooki
             r = sum(reacts.get(n, {}).values())
             v = views.get(n, 0)
             return r * 3 + v
-        selected = sorted(names, key=score, reverse=True)[:15]
+        target_count = max(5, min(MAX_HIGHLIGHT_FILES, round(duration_sec / 3)))
+        selected = sorted(names, key=score, reverse=True)[:target_count]
 
     if not selected:
         raise HTTPException(400, "No photos available for highlight video")
 
     # Resolve music file path (None = silent)
     music_path_local: str | None = None
-    if music_key and music_key in MUSIC_TRACKS:
-        p = MUSIC_DIR / MUSIC_TRACKS[music_key]["file"]
-        if p.exists():
-            music_path_local = str(p)
-        else:
-            log.warning("Highlight: music '%s' requested but file missing — silent fallback", music_key)
+    if music_key:
+        tracks = _all_music_tracks()
+        if music_key in tracks:
+            p = MUSIC_DIR / tracks[music_key]["file"]
+            if p.exists():
+                music_path_local = str(p)
+            else:
+                log.warning("Highlight: music '%s' requested but file missing — silent fallback", music_key)
 
     # Generate the video to a local temp file
     try:
         out_path, tmp_images = await _run_blocking(
-            _create_highlight_video_sync, folder, selected, music_path_local
+            _create_highlight_video_sync, folder, selected, music_path_local, duration_sec
         )
     except subprocess.CalledProcessError as e:
         raise HTTPException(500, f"ffmpeg failed: {e.stderr.decode()[-300:]}")
